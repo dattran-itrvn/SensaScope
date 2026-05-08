@@ -36,6 +36,14 @@ int      session_stop(void);              /* close current session */
 bool     session_is_active(void);
 uint32_t session_current_id(void);        /* 0 if none active */
 
+/* True if the most recent session ended because the watchdog forced it
+ * down (writer thread died unexpectedly). False if the session was
+ * stopped by an explicit session_stop() call. Cleared on the next
+ * session_start. The main FSM uses this to decide whether the next
+ * state should be IDLE (clean stop) or ERROR (fault).
+ */
+bool     session_was_aborted(void);
+
 /* Rotation period override — call before session_start() to test fast
  * rotation (e.g. 30 s) without recompiling. Default 600 s.
  */

@@ -13,9 +13,16 @@
 
 typedef void (*imu_tap_cb_t)(void);
 
-/* Probe LSM6DSL on I2C, returns 0 if WHO_AM_I matches. */
+/* Probe LSM6DSL on I2C and configure XL (416 Hz / ±2 g) + G (52 Hz / ±245 dps)
+ * + BDU. Returns 0 on success.
+ */
 int     imu_init(void);
 uint8_t imu_who_am_i(void);
+
+/* Burst-read 6 axes (raw int16 LSB).
+ * Output order: accel_xyz[ax,ay,az], gyro_xyz[gx,gy,gz].
+ */
+int     imu_read_xlg(int16_t accel_xyz[3], int16_t gyro_xyz[3]);
 
 /* Configure double-tap on X/Y/Z and route to INT1.
  * cb is called from system work-queue context (k_work) — don't sleep there.

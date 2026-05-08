@@ -1,12 +1,13 @@
 /*
  * SensaPulse v1.0 firmware — main entry.
  *
- * Phase 6 (task #10): streaming recorder.
+ * Task #11: IMU CSV + meta.json wired alongside the audio recorder.
  *  - Boot probes peripherals (LED / battery / IMU / audio / SD / BLE).
  *  - Idle: heartbeat blink @ 1 Hz, LED off when idle (toggling = idle pattern).
- *  - Double-tap on body → toggle recording: opens /SD:/REC.WAV (overwrite),
- *    streams 16 kHz/16-bit stereo to SD until next double-tap.
+ *  - Double-tap on body → toggle recording. Start writes meta.json once and
+ *    fires both writers (audio.wav + imu.csv); stop signals both writers.
  *  - LED solid ON while recording (full FSM in task #13).
+ *  - Folder rotation lives in task #12; for now files are flat at the SD root.
  */
 
 #include <zephyr/kernel.h>
@@ -18,14 +19,18 @@
 #include "led.h"
 #include "battery.h"
 #include "imu.h"
+#include "imu_sampler.h"
 #include "audio.h"
 #include "sd_log.h"
+#include "session.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 #define SMOKE_WAV_PATH    SD_MOUNT_POINT "/PDM_TEST.WAV"
 #define SMOKE_RECORD_S    3
 #define REC_WAV_PATH      SD_MOUNT_POINT "/REC.WAV"
+#define REC_CSV_PATH      SD_MOUNT_POINT "/REC.CSV"
+#define REC_META_PATH     SD_MOUNT_POINT "/META.JSON"
 
 /* ---------- BLE smoke advertise ---------- */
 static const struct bt_data adv_data[] = {
@@ -60,19 +65,30 @@ static int start_ble(void)
 /* ---------- Double-tap → toggle record ---------- */
 static void on_double_tap(void)
 {
-	if (audio_recorder_is_running()) {
+	if (audio_recorder_is_running() || imu_sampler_is_running()) {
 		LOG_INF(">>> DOUBLE TAP — stopping recording");
 		audio_recorder_stop();
-		/* LED return to idle after recorder thread finishes (poll below) */
-	} else {
-		LOG_INF(">>> DOUBLE TAP — starting recording → %s", REC_WAV_PATH);
-		int ret = audio_recorder_start(REC_WAV_PATH);
-		if (ret) {
-			LOG_ERR("audio_recorder_start failed: %d", ret);
-			return;
-		}
-		led_on();   /* solid ON while recording */
+		imu_sampler_stop();
+		/* LED returns to idle after recorder threads finish (poll in main). */
+		return;
 	}
+
+	LOG_INF(">>> DOUBLE TAP — starting recording");
+	int batt_mv = battery_read_mv();
+	session_write_meta(REC_META_PATH, batt_mv);
+
+	int ret = audio_recorder_start(REC_WAV_PATH);
+	if (ret) {
+		LOG_ERR("audio_recorder_start failed: %d", ret);
+		return;
+	}
+	ret = imu_sampler_start(REC_CSV_PATH);
+	if (ret) {
+		LOG_ERR("imu_sampler_start failed: %d — stopping audio", ret);
+		audio_recorder_stop();
+		return;
+	}
+	led_on();   /* solid ON while recording */
 }
 
 /* ---------- main ---------- */
@@ -110,14 +126,15 @@ int main(void)
 
 	bool prev_recording = false;
 	while (1) {
-		bool now_recording = audio_recorder_is_running();
+		bool now_recording =
+			audio_recorder_is_running() || imu_sampler_is_running();
 		if (now_recording) {
 			led_on();   /* solid ON while recording */
 		} else {
 			if (prev_recording) {
-				LOG_INF("Recorder stopped, %u B written to %s",
+				LOG_INF("Stopped: audio=%u B, imu=%u samples",
 					audio_recorder_bytes_written(),
-					REC_WAV_PATH);
+					imu_sampler_samples_written());
 			}
 			led_toggle();  /* idle: heartbeat blink */
 		}

@@ -11,7 +11,9 @@ LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
 /* Register map (subset, see ST DS11990 §9 / AN5040). */
 #define LSM6DSL_REG_WHO_AM_I    0x0F
 #define LSM6DSL_REG_CTRL1_XL    0x10
+#define LSM6DSL_REG_CTRL2_G     0x11
 #define LSM6DSL_REG_CTRL3_C     0x12
+#define LSM6DSL_REG_OUTX_L_G    0x22  /* gyro X low; +12 covers gyro+accel */
 #define LSM6DSL_REG_TAP_CFG     0x58
 #define LSM6DSL_REG_TAP_THS_6D  0x59
 #define LSM6DSL_REG_INT_DUR2    0x5A
@@ -19,6 +21,21 @@ LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
 #define LSM6DSL_REG_MD1_CFG     0x5E
 
 #define LSM6DSL_WHO_AM_I_VAL    0x6A
+
+/* Sensor stack config (kept in sync with #11 sampler).
+ *  CTRL1_XL = 0x60: XL ODR=416 Hz, FS=±2 g.
+ *               XL stays at 416 Hz so hardware tap detect still works
+ *               (AN5040 wants ≥208 Hz). The 52 Hz CSV sampler just polls
+ *               the registers at its own rate — slight aliasing is fine
+ *               for activity classification.
+ *  CTRL2_G  = 0x30: GYRO ODR=52 Hz, FS=±245 dps.
+ *  CTRL3_C  = 0x44: BDU=1 (block-data-update — output regs are frozen
+ *               between MSB/LSB read pairs), IF_INC=1 (auto-increment
+ *               on multi-byte burst reads).
+ */
+#define LSM6DSL_CTRL1_XL_VAL    0x60
+#define LSM6DSL_CTRL2_G_VAL     0x30
+#define LSM6DSL_CTRL3_C_VAL     0x44
 
 static const struct i2c_dt_spec imu_i2c = I2C_DT_SPEC_GET(LSM6DSL_NODE);
 static const struct gpio_dt_spec int1 =
@@ -60,8 +77,37 @@ int imu_init(void)
 		LOG_ERR("Unexpected WHO_AM_I = 0x%02X", who);
 		return -EIO;
 	}
-	LOG_INF("LSM6DSL @ 0x%02X: WHO_AM_I = 0x%02X (OK)",
+
+	int ret;
+	ret = reg_write(LSM6DSL_REG_CTRL3_C,  LSM6DSL_CTRL3_C_VAL);  if (ret) goto fail;
+	ret = reg_write(LSM6DSL_REG_CTRL1_XL, LSM6DSL_CTRL1_XL_VAL); if (ret) goto fail;
+	ret = reg_write(LSM6DSL_REG_CTRL2_G,  LSM6DSL_CTRL2_G_VAL);  if (ret) goto fail;
+
+	LOG_INF("LSM6DSL @ 0x%02X: WHO_AM_I=0x%02X, XL=416Hz/±2g, G=52Hz/±245dps",
 		imu_i2c.addr, who);
+	return 0;
+
+fail:
+	LOG_ERR("imu_init: reg config failed: %d", ret);
+	return ret;
+}
+
+int imu_read_xlg(int16_t accel_xyz[3], int16_t gyro_xyz[3])
+{
+	/* Burst-read 12 bytes from OUTX_L_G. Chip layout: gx,gy,gz then ax,ay,az
+	 * (little-endian int16 each). BDU=1 in CTRL3_C ensures consistent pairs.
+	 */
+	int16_t raw[6];
+	int ret = i2c_burst_read_dt(&imu_i2c, LSM6DSL_REG_OUTX_L_G,
+				    (uint8_t *)raw, sizeof(raw));
+	if (ret) return ret;
+
+	gyro_xyz[0]  = raw[0];
+	gyro_xyz[1]  = raw[1];
+	gyro_xyz[2]  = raw[2];
+	accel_xyz[0] = raw[3];
+	accel_xyz[1] = raw[4];
+	accel_xyz[2] = raw[5];
 	return 0;
 }
 
@@ -89,11 +135,10 @@ int imu_enable_double_tap(imu_tap_cb_t cb)
 	user_tap_cb = cb;
 	k_work_init(&tap_work, tap_work_handler);
 
-	/* CTRL1_XL = 0x60: XL ODR=416 Hz, FS=±2 g, no LPF1 modification.
-	 * Tap detection works best at ≥208 Hz.
+	/* CTRL1_XL is already configured at 416 Hz / ±2 g by imu_init().
+	 * Tap detection works best at ≥208 Hz; this is also the rate the CSV
+	 * sampler polls (at 52 Hz, with implicit downsampling).
 	 */
-	ret = reg_write(LSM6DSL_REG_CTRL1_XL, 0x60);
-	if (ret) goto err;
 
 	/* TAP_CFG = 0x8E: latch interrupt; enable Z, Y, X tap recognition.
 	 *   bit7 INTERRUPTS_ENABLE

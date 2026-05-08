@@ -1,0 +1,58 @@
+{
+	"$schema": "https://json.schemastore.org/claude-code-settings.json",
+	"_comment": "Move this file to .claude/settings.json (mkdir -p .claude && mv scripts/claude_settings.json .claude/settings.json) — Cowork mode can't write to dot-prefixed paths.",
+	"permissions": {
+		"allow": [
+			"Bash(cd /Users/trandat/Project/SensaScope*)",
+			"Bash(west *)",
+			"Bash(rm -rf /Users/trandat/Project/SensaScope/app/build)",
+			"Bash(rm -rf /Users/trandat/Project/SensaScope/app/build/*)",
+			"Bash(rm -f /Users/trandat/Project/SensaScope/logs/*)",
+			"Bash(rm -f /Users/trandat/Project/SensaScope/runs/*/*)",
+			"Bash(JLinkExe *)",
+			"Bash(JLinkRTTClient*)",
+			"Bash(JLinkRTTLogger *)",
+			"Bash(pkill -f JLink*)",
+			"Bash(timeout * JLink*)",
+			"Bash(timeout * west*)",
+			"Bash(python3 /Users/trandat/Project/SensaScope/scripts/*)",
+			"Bash(bash /Users/trandat/Project/SensaScope/scripts/*)",
+			"Bash(/Users/trandat/Project/SensaScope/scripts/*)",
+			"Bash(cat /Users/trandat/Project/SensaScope/*)",
+			"Bash(grep *)",
+			"Bash(head *)",
+			"Bash(tail *)",
+			"Bash(wc *)",
+			"Bash(ls *)",
+			"Bash(date *)",
+			"Bash(date)",
+			"Bash(echo *)",
+			"Bash(mkdir -p /Users/trandat/Project/SensaScope/*)",
+			"Read(/Users/trandat/Project/SensaScope/**)",
+			"Read(/opt/nordic/ncs/v2.9.3/**)",
+			"Edit(/Users/trandat/Project/SensaScope/**)",
+			"Write(/Users/trandat/Project/SensaScope/logs/**)",
+			"Write(/Users/trandat/Project/SensaScope/runs/**)",
+			"Write(/Users/trandat/Project/SensaScope/scripts/**)",
+			"Write(/Users/trandat/Project/SensaScope/playbooks/**)"
+		],
+		"deny": [
+			"Bash(sudo *)",
+			"Bash(rm -rf /)",
+			"Bash(rm -rf /Users)",
+			"Bash(rm -rf /Users/trandat)",
+			"Bash(rm -rf ~)",
+			"Bash(git push *)",
+			"Bash(git reset --hard *)",
+			"Bash(curl *)",
+			"Bash(wget *)",
+			"Bash(brew uninstall*)",
+			"Bash(npm uninstall*)",
+			"Edit(/Users/trandat/Project/SensaScope/CLAUDE.md)"
+		]
+	},
+	"env": {
+		"ZEPHYR_BASE": "/opt/nordic/ncs/v2.9.3/zephyr",
+		"PATH_PREPEND": "/opt/nordic/ncs/toolchains/b8efef2ad5/bin:/opt/nordic/ncs/toolchains/b8efef2ad5/opt/zephyr-sdk/arm-zephyr-eabi/bin:/Applications/nRF Command Line Tools.app/Contents/Resources/bin"
+	}
+}

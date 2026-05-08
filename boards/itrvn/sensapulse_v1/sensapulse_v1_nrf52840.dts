@@ -1,0 +1,70 @@
+/*
+ * ITRVN SensaPulse v1.0 — wearable stethoscope
+ * MCU module: Ebyte E73-2G4M08S1C (nRF52840 QIAA)
+ * Schematic ref: Wearable Stethoscope PCB v1.0 - SCHEMATIC_2026-04-09
+ *
+ * Phase 1 (this file): minimal board — LED + flash partitions + GPIO
+ * + 32.768 kHz LFXTAL. Other peripherals (I2C, SPI, PDM, ADC, USB) are
+ * added per-bring-up via per-app overlay files in app/boards/*.overlay.
+ */
+
+/dts-v1/;
+#include <nordic/nrf52840_qiaa.dtsi>
+#include "sensapulse_v1_nrf52840-pinctrl.dtsi"
+
+/ {
+	model = "ITRVN SensaPulse v1.0";
+	compatible = "itrvn,sensapulse-v1";
+
+	chosen {
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &code_partition;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		led_status: led_0 {
+			gpios = <&gpio0 3 GPIO_ACTIVE_HIGH>;
+			label = "Status LED (P0.03 via N-MOSFET)";
+		};
+	};
+
+	aliases {
+		led0 = &led_status;
+		watchdog0 = &wdt0;
+	};
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&gpiote {
+	status = "okay";
+};
+
+&uicr {
+	gpio-as-nreset;
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		code_partition: partition@0 {
+			label = "code";
+			reg = <0x00000000 0x000F8000>;  /* 992 KB */
+		};
+		storage_partition: partition@f8000 {
+			label = "storage";
+			reg = <0x000F8000 0x00008000>;  /* 32 KB */
+		};
+	};
+};

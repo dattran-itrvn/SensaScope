@@ -1,0 +1,50 @@
+/*
+ * SensaPulse v1.0 pin control mapping
+ * Maps peripherals to physical GPIO pins per schematic 2026-04-09.
+ */
+
+&pinctrl {
+	/* I2C0: LSM6DSL IMU.
+	 * PCB v1.0 has no external pull-ups on SDA/SCL — must enable
+	 * nRF internal pull-ups (~13K typ.) to make the bus functional.
+	 */
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 12)>,
+				<NRF_PSEL(TWIM_SCL, 0, 4)>;
+			bias-pull-up;
+		};
+	};
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 12)>,
+				<NRF_PSEL(TWIM_SCL, 0, 4)>;
+			low-power-enable;
+		};
+	};
+
+	/* SPI3: micro-SD card (high-speed SPIM) */
+	spi3_default: spi3_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 17)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 20)>,
+				<NRF_PSEL(SPIM_MISO, 0, 15)>;
+		};
+	};
+	spi3_sleep: spi3_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 17)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 20)>,
+				<NRF_PSEL(SPIM_MISO, 0, 15)>;
+			low-power-enable;
+		};
+	};
+
+	/* PDM: stereo MEMS mics (body=L, ambient=R, shared CLK+DATA) */
+	pdm0_default: pdm0_default {
+		group1 {
+			psels = <NRF_PSEL(PDM_CLK, 1, 9)>,
+				<NRF_PSEL(PDM_DIN, 0, 5)>;
+		};
+	};
+};

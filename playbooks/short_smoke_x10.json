@@ -1,0 +1,12 @@
+{
+	"name": "short_smoke_x10",
+	"description": "10 fast iterations of build+flash+30s capture. Smoke test of the loop infrastructure itself, not a stress test of firmware.",
+	"iterations": 10,
+	"per_iter_seconds": 30,
+	"pristine_first": false,
+	"stop_on_error": true,
+	"expect": {
+		"booted": true,
+		"errors_max": 0
+	}
+}

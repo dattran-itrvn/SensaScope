@@ -1,0 +1,13 @@
+{
+	"name": "long_recording_stability",
+	"description": "Single 30-min capture: boot, no double-tap (just observe firmware running). Checks for SD errors, battery drop rate, and crash-free idle.",
+	"iterations": 1,
+	"per_iter_seconds": 1800,
+	"pristine_first": true,
+	"stop_on_error": true,
+	"expect": {
+		"booted": true,
+		"battery_mv_min": 3500,
+		"errors_max": 0
+	}
+}

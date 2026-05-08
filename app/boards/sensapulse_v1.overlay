@@ -1,0 +1,89 @@
+/*
+ * App-level overlay for sensapulse_v1/nrf52840.
+ * Auto-applied by Zephyr build for this board target.
+ *
+ * Adds peripherals as we bring each one up. Add new sections below;
+ * don't pollute the board DTS.
+ */
+
+/* ---------- Task #4: I2C0 + LSM6DSL IMU ---------- */
+&i2c0 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_STANDARD>;  /* 100 kHz — safe with internal pull-ups */
+
+	lsm6dsl: lsm6dsl@6a {
+		compatible = "st,lsm6dsl";
+		reg = <0x6a>;            /* SDO/SA0=GND → 0x6A */
+		/* LSM6DSL INT1 default = push-pull active HIGH (CTRL3_C.H_LACTIVE=0). */
+		irq-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/* ---------- Task #7: SAADC battery monitor on AIN4 (P0.28) ---------- */
+/*
+ * VBATT --[100k R12]--+--[100k R15]-- GND  (1:2 divider)
+ *                     |
+ *                     +--> AIN4 (P0.28)
+ * To get VBATT: read AIN4_mV, multiply by 2.
+ */
+/ {
+	vbatt: vbatt {
+		compatible = "voltage-divider";
+		io-channels = <&adc 4>;
+		output-ohms = <100000>;
+		full-ohms  = <200000>;
+	};
+};
+
+&adc {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells    = <0>;
+
+	channel@4 {
+		reg = <4>;
+		zephyr,gain              = "ADC_GAIN_1_6";
+		zephyr,reference         = "ADC_REF_INTERNAL";   /* 0.6 V */
+		zephyr,acquisition-time  = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive    = <NRF_SAADC_AIN4>;     /* AIN4 = P0.28 */
+		zephyr,resolution        = <12>;
+	};
+};
+
+/* ---------- Task #6: PDM stereo (body=L falling, ambient=R rising) ---------- */
+&pdm0 {
+	status = "okay";
+	pinctrl-0 = <&pdm0_default>;
+	pinctrl-names = "default";
+	clock-source = "PCLK32M_HFXO";  /* HFXO-derived for low-jitter audio */
+};
+
+/* ---------- Task #5: SPI3 + micro-SD via SDHC SPI slot ---------- */
+&spi3 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+	pinctrl-0 = <&spi3_default>;
+	pinctrl-1 = <&spi3_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
+
+	sdhc0: sdhc@0 {
+		compatible = "zephyr,sdhc-spi-slot";
+		reg = <0>;
+		status = "okay";
+		spi-max-frequency = <24000000>;
+
+		mmc {
+			compatible = "zephyr,sdmmc-disk";
+			status = "okay";
+			/* Note: disk name is hardcoded to "SD" by the
+			 * sdmmc-disk driver in Zephyr 3.7 / NCS v2.9 —
+			 * no `disk-name` property accepted.
+			 */
+		};
+	};
+};

@@ -1,0 +1,51 @@
+# Build artifacts
+app/build/
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+
+# Loop / overnight test outputs (regenerable, can be huge)
+logs/
+runs/
+
+# Recordings (don't commit captured audio)
+*.wav
+!docs/samples/*.wav     # whitelist a samples folder if we ever want to ship example audio
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# IDE / editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.bak
+*.swp
+*~
+
+# macOS / Windows / Linux junk
+.DS_Store
+._*
+Thumbs.db
+
+# Zephyr / west / NCS local artifacts
+.west/
+.nrfconnect/
+
+# Sensitive (must never be committed)
+*.key
+*.pem
+*.p12
+secrets/
+device.name
+sync_state.json

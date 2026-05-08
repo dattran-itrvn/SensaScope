@@ -1,0 +1,5 @@
+board:
+  name: sensapulse_v1
+  vendor: itrvn
+  socs:
+    - name: nrf52840

@@ -1,0 +1,17 @@
+identifier: sensapulse_v1/nrf52840
+name: ITRVN SensaPulse v1.0 (E73-2G4M08S1C)
+type: mcu
+arch: arm
+ram: 256
+flash: 1024
+toolchain:
+  - zephyr
+  - gnuarmemb
+supported:
+  - adc
+  - gpio
+  - i2c
+  - pdm
+  - spi
+  - usb_device
+  - watchdog

@@ -1,0 +1,160 @@
+# SensaPulse — Task List
+
+This is the canonical, version-controlled source of truth for what's done and what's next. Cowork (planner) and Claude Code (executor) both read it. When you complete or modify a task, edit this file and commit.
+
+Tasks #8 was descoped (USB CDC shell — RTT is sufficient for debug). Numbering otherwise sequential.
+
+## Status legend
+- ✅ done
+- 🚧 in progress
+- ⏳ pending
+- 🗑️ descoped
+
+---
+
+## v1.0 — local recording firmware (no BLE sync)
+
+### Bring-up phase (peripheral verification)
+
+**#1 ✅ Custom board definition `sensapulse_v1`**
+Create `boards/itrvn/sensapulse_v1/` with `board.yml`, `Kconfig.sensapulse_v1`, `Kconfig.defconfig`, `board.cmake`, `sensapulse_v1_nrf52840.dts`, `sensapulse_v1_nrf52840.yaml`, `sensapulse_v1_nrf52840_defconfig`, `sensapulse_v1_nrf52840-pinctrl.dtsi`. Pin map per `CLAUDE.md` GPIO table.
+
+**#2 ✅ App skeleton**
+`app/CMakeLists.txt` (BOARD_ROOT trick), `app/prj.conf` (GPIO + LOG + RTT), `app/src/main.c` doing only LED blink to verify board definition compiles + flashes.
+
+**#3 ✅ LED blink smoke test on real PCB v1.0**
+`west build -b sensapulse_v1/nrf52840 -p auto -- -DBOARD_ROOT=...` then `west flash`. Verify LED on P0.03 toggles 1 Hz.
+
+**#4 ✅ I2C + LSM6DSL WHO_AM_I**
+Config I2C0 on P0.04 (SCL) / P0.12 (SDA). Read register `0x0F` of LSM6DSL at I²C addr `0x6A`. Expect `0x6A`. Verified — required `bias-pull-up` in pinctrl because PCB v1.0 has no external pull-ups, and forced `I2C_BITRATE_STANDARD` (100 kHz) since internal pull-ups are weak.
+
+**#5 ✅ SPI + micro-SD + FATFS mount**
+SPI3 on `P0.17/P0.15/P0.20`, CS `P0.22`, card-detect `P0.26`. Mount FATFS, list root, append boot stamp to `/SD/SP_BOOTS.TXT`. Verified with 30 GB SanDisk card.
+
+**#6 ✅ PDM stereo 16 kHz / 16-bit capture**
+`nrfx_pdm` via Zephyr DMIC API. CLK=P1.09, DIN=P0.05. Stereo: ch0=body (MP23DB01HP, falling edge), ch1=ambient (IMP34DT05, rising edge). Save to WAV with canonical 44-byte header. Verified — peaks ~9000, no clipping at 0 dB gain.
+
+**#7 ✅ SAADC battery monitor**
+ADC channel on AIN4 (P0.28). VBATT divided 1:2 by R12/R15 (100K/100K). Read in mV, multiply by 2 for VBATT. Classify into full / ok / low / warn / critical. Verified at 4112 mV (Li-ion full).
+
+**#8 🗑️ USB CDC ACM test shell (descoped — RTT is enough)**
+
+**#16 ✅ BLE smoke advertise**
+Enable nRF SoftDevice controller. Advertise as `"SensaPulse v1"` (connectable, no GATT services yet). Verify discoverable from nRF Connect for Mobile. Phone connect/disconnect logged via callbacks.
+
+### Feature phase (Milestone A — recording engine)
+
+**#9 ✅ LSM6DSL double-tap detection via INT1**
+Configure `TAP_CFG`/`TAP_THS_6D`/`INT_DUR2`/`WAKE_UP_THS`/`MD1_CFG` per AN5040 recipe. Route `DOUBLE_TAP` event to `INT1` pin (P0.06, active high). GPIO interrupt callback → `k_work` → user callback. Currently used to log `*** DOUBLE TAP #N ***`; will toggle record state in #14.
+
+**#10 ✅ Streaming WAV writer + start/stop API**
+`audio_recorder_start(path)` / `audio_recorder_stop()` async API. Writer thread (4 KB stack, prio 5) reads PDM blocks via DMIC, writes to file, accumulates byte count. On stop: finalize 44-byte WAV header at offset 0, close file. Verified streaming 14 s = 896000 B exactly (no drops, ~62 kB/s).
+
+**#11 ⏳ IMU CSV writer + meta.json**
+- New module `imu_sampler.c/h`. Sample LSM6DSL accel + gyro at **52 Hz** via blocking read or hardware FIFO.
+- CSV header: `t_us,ax,ay,az,gx,gy,gz`. Raw LSB units, NO calibration in firmware.
+- Buffer ~1 s of samples in RAM, then flush in a single `fs_write` call (reduces FATFS overhead).
+- `meta.json` written once per session with: `start_rtc_ms` (currently `k_uptime_get()` since RTC isn't wired), `fs_audio=16000`, `fs_imu=52`, `fw_version`, `batt_mv_start`, `build_hash` (commit short SHA), `device_name`, `chip_id`.
+- Hook into existing `audio_recorder_start/stop` so all three writers come up/tear down together.
+- Smoke test: 30 s recording → check audio.wav + imu.csv + meta.json all on SD, all valid.
+
+**#12 ⏳ Session manager + 10-min rotation**
+- New module `session.c/h` owning the lifecycle of a session folder.
+- On `session_start()`: pick next sequential id (counter persisted in `/SD/sync_state.json`), `mkdir /SD/SESSION_NNNNN/`, open `audio.wav` + `imu.csv` + `meta.json`, touch `.unsynced` marker.
+- Internal timer fires at +10 min: `session_rotate()` — close current, open next. Must be **seamless** (no audio gap > 1 PDM block ≈ 100 ms).
+- On `session_stop()` (double-tap): close files, finalize WAV header, write final meta.json fields.
+- Free-space management (overlaps with #17 below): pre-flight check before opening new folder. If <100 MB free *and* synced folders exist → evict oldest. If <100 MB *and no* synced folders → enter ERROR state (LED SOS, refuse new recording).
+- Tests: trigger rotation manually (shorten timer to 30 s temporarily), verify 2-3 consecutive folders all valid.
+
+**#13 ⏳ LED state machine**
+- Refactor `led.c/h` from current toggle helpers to `led_set_state(led_state_t)` API.
+- States: `IDLE` (1 Hz blink, ~10 % duty), `RECORDING` (solid on), `SYNC` (2 Hz blink, ~50 % duty — preview for v1.1), `LOW_BATT` (5 Hz blink), `ERROR` (SOS Morse — `... --- ...`).
+- Implementation via `k_timer` callback firing every 100 ms, walking a state-specific pattern.
+- Main thread or peripheral modules call `led_set_state()` to transition; LED module owns actual GPIO writes.
+- Smoke test: drive each state from a small test harness, eyeball pattern correctness.
+
+**#14 ⏳ Main state machine + integration**
+- Replace the current "boot tests then idle blink" main flow with a real state machine:
+  - `STATE_IDLE`: LED idle pattern. Listening for double-tap (→ `RECORDING`) and (v1.1) BLE connect (→ `SYNC`).
+  - `STATE_RECORDING`: LED solid. Session writers running. Double-tap stops → returns to IDLE. Battery monitor every 30 s; if `< 3300 mV` → auto-stop session and transition to `STATE_LOW_BATT_HOLDOFF` (LED low_batt pattern, ignore taps).
+  - `STATE_ERROR`: LED SOS. Reached when SD full + no synced folders, or unrecoverable FATFS error.
+- Wire #11/#12/#13 modules together. Verify start/stop via double-tap, rotation seamless, LED follows state.
+
+**#15 ⏳ Python session loader (PC tool)**
+- `tools/load_session.py` — `load_session(path: Path) -> dict`:
+  - `audio: np.ndarray of shape (N, 2), dtype=int16`
+  - `fs_audio: 16000`
+  - `imu: pd.DataFrame with columns t_us, ax, ay, az, gx, gy, gz`
+  - `fs_imu: 52`
+  - `meta: dict` (parsed JSON)
+- Use `scipy.io.wavfile.read` for audio, `pandas.read_csv` for imu.csv.
+- Verify timestamps consistent (PDM clock vs IMU `i*Ts`).
+- Once #14 produces real sessions, smoke-test loader against actual data.
+
+---
+
+## v1.1 — BLE sync (full spec in `docs/SYNC_PROTOCOL.md`)
+
+**#17 ⏳ Session marker + persistent counter + free-space eviction**
+- Implement `.unsynced` 0-byte marker file written when a new session folder is created (overlaps with #12 — keep them in lockstep).
+- Persist next-session-id counter in `/SD/sync_state.json` (read on boot, increment on session create).
+- Free-space eviction logic: scan unsynced/synced folders, delete oldest synced when free < 100 MB.
+- ERROR-state entry path: SD full + no synced folders → set `state = ERROR`, LED SOS, refuse `session_start`.
+
+**#18 ⏳ Device name file + chip-id fallback**
+- Read `/SD/device.name` (max 32 bytes UTF-8) on boot. Strip newline.
+- If file absent or empty: format chip ID from `NRF_FICR->DEVICEID[0..1]` (two `uint32_t` → 16 hex chars) into `"chip_<hex>"`.
+- Expose name + chip_id in BLE `Device Info` characteristic.
+- BLE `Set Name` characteristic (write): persists to file, takes effect immediately.
+
+**#19 ⏳ BLE Sync Service GATT (firmware)**
+- Implement custom service per `docs/SYNC_PROTOCOL.md`. Service UUID `7e7e0001-3c4f-4b8e-8a8a-5e5e5e5e5e5e`.
+- Characteristics: Device Info (read JSON), Control (write+notify, opcodes `LIST/READ/ACK/ABORT/DEL/RESET`), Data (notify only, bulk file stream), Set Name (write).
+- On connect: negotiate PHY 2M + MTU 247 + connection interval 7.5 ms.
+- Refuse Control ops with status `0x01 busy` if device is `RECORDING`.
+- New module `ble_sync.c/h` plus tweaks to `prj.conf` for the BT macros.
+
+**#20 ⏳ State machine: IDLE / RECORDING / SYNC mutual exclusion**
+- Update `STATE_*` enum to include `STATE_SYNC`.
+- Transitions:
+  - `IDLE → RECORDING` via double-tap (existing).
+  - `RECORDING → IDLE` via double-tap (existing).
+  - `IDLE → SYNC` on BLE connect (new).
+  - `SYNC → IDLE` on BLE disconnect (new).
+  - `RECORDING → SYNC` forbidden — reject BLE connect with disconnect reason 0x13 or similar.
+  - `SYNC → RECORDING` forbidden — drop double-tap events while in SYNC.
+- BLE controller off in `RECORDING` (saves power + frees nRF radio for hypothetical noise audit), on in `IDLE`.
+- ERROR state still allows `SYNC` (so user can drain unsynced data even when SD is full).
+
+**#21 ⏳ PC sync CLI (Python + bleak)**
+- Fill in `tools/sync.py` stubs: `cmd_list`, `cmd_read`, `cmd_ack`.
+- Atomic transfer: write to `<root>/<device_label>/SESSION_NNNNN.tmp/`, rename to `SESSION_NNNNN/` only when all three files present and ACK succeeded on device.
+- `--resume` mode: scan `.tmp/` directories, query device for current file size, resume `READ` from `offset`.
+- Logging: structured INFO output, suitable for parsing by the run_loop driver.
+
+---
+
+## Production hardening (from `docs/PRODUCTION_TODO.md`)
+
+Not assigned task numbers yet because they're milestones for after v1.1 ships. Don't start without explicit user direction.
+
+- BLE pairing + bonding (LE Secure Connections)
+- Per-device factory key + AES-GCM payload encryption (optional)
+- Brown-out detector + watchdog
+- FATFS power-fail recovery (`f_sync` after each block)
+- Real-time clock initialization (PC sync sets RTC on connect)
+- MCUboot + BLE OTA
+- GUI sync app (PyQt or Electron)
+- Mobile companion (BLE 5.0 Phone — 2M PHY support varies)
+- FCC/CE radiated emissions test in final enclosure
+
+---
+
+## How to update this file
+
+When a task moves status:
+1. Edit this file inline (change emoji + add a short note about what was verified).
+2. If new tasks emerge, append at the bottom of the appropriate section with the next free number.
+3. Commit with message `tasks: #N status → done` or similar.
+
+Cowork's in-memory task list is the *historical* source — this file (`TASKS.md`) is now the *living* source.

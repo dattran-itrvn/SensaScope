@@ -82,16 +82,16 @@ Configure `TAP_CFG`/`TAP_THS_6D`/`INT_DUR2`/`WAKE_UP_THS`/`MD1_CFG` per AN5040 r
   - `STATE_ERROR`: LED SOS. Reached when SD full + no synced folders, or unrecoverable FATFS error.
 - Wire #11/#12/#13 modules together. Verify start/stop via double-tap, rotation seamless, LED follows state.
 
-**#15 ⏳ Python session loader (PC tool)**
+**#15 ✅ Python session loader (PC tool)**
 - `tools/load_session.py` — `load_session(path: Path) -> dict`:
   - `audio: np.ndarray of shape (N, 2), dtype=int16`
   - `fs_audio: 16000`
   - `imu: pd.DataFrame with columns t_us, ax, ay, az, gx, gy, gz`
   - `fs_imu: 52`
   - `meta: dict` (parsed JSON)
-- Use `scipy.io.wavfile.read` for audio, `pandas.read_csv` for imu.csv.
-- Verify timestamps consistent (PDM clock vs IMU `i*Ts`).
-- Once #14 produces real sessions, smoke-test loader against actual data.
+- Uses stdlib `wave` + numpy instead of `scipy.io.wavfile` (scipy is a heavy dep we don't need for one read; the macOS dev env doesn't ship it). `pandas.read_csv` for imu.csv.
+- `python -m tools.load_session <path>` prints a summary: duration, peak/mean per channel, IMU effective rate, audio↔IMU drift.
+- **Verified** against an uploaded test session (SESSION_00002): 46.60 s audio, IMU `fs_eff=51.97 Hz`, drift `+72.6 ms` — matches Cowork's bench-side analysis (73 ms / 51.97 Hz).
 
 ---
 

@@ -41,8 +41,8 @@ Units: hours. 1 working day = 8 h. Use decimals (e.g. 0.5 h, 2.5 h).
 | 12 | Session manager + 10-min rotation | 6 | 3 | -50 % | Rotation timer + persistent counter + watchdog all fit in one batch — simpler than the "rotation seamlessness" framing implied because the existing audio + imu writer threads already had the right hooks (mid-loop atomic check, ring-buffered samples). The slack came from #11 having shown the writer-coordination pattern already. |
 | 13 | LED state machine | 1.5 | — | — | |
 | 14 | Main state machine + integration | 3 | — | — | |
-| 15 | Python session loader | 0.5 | — | — | |
-| **v1.0 remaining subtotal** | | **14 h** | **6 h (so far)** | | |
+| 15 | Python session loader | 0.5 | 0.5 | 0 % | Stdlib `wave` + numpy + pandas; spec said scipy but scipy is heavy and not in the dev env. Smoke against uploaded fixture matched Cowork's drift / fs_eff numbers exactly. |
+| **v1.0 remaining subtotal** | | **14 h** | **6.5 h (so far)** | | |
 
 ---
 

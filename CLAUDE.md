@@ -154,6 +154,8 @@ boards/itrvn/sensapulse_v1/
 
 The canonical, in-tree task list lives in `TASKS.md`. Cowork's in-memory task list is the *historical* source; `TASKS.md` is the *living* source you should read before starting work and edit when you finish or modify a task. Numbering is stable; never renumber.
 
+When you close a task, also append the actual hours spent in `docs/TIMING.md` (estimate, actual, variance, brief note on what caused over/under). This is the calibration data for future estimates. Don't skip and don't round optimistically — the data is only useful if it's honest.
+
 ## Memory
 
 The Cowork agent maintains a longer-form memory across sessions in a separate location. You don't share that memory directly, but this CLAUDE.md is your snapshot of it.

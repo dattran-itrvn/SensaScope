@@ -27,8 +27,9 @@ static K_THREAD_STACK_DEFINE(samp_stack, SAMPLER_STACK_SZ);
 static struct k_thread samp_thread;
 
 static struct fs_file_t  csv_file;
-static atomic_t          samp_running  = ATOMIC_INIT(0);
-static atomic_t          samp_stop_req = ATOMIC_INIT(0);
+static atomic_t          samp_running    = ATOMIC_INIT(0);
+static atomic_t          samp_stop_req   = ATOMIC_INIT(0);
+static atomic_t          samp_rotate_req = ATOMIC_INIT(0);
 static volatile uint32_t samp_count;
 static uint32_t          samp_dropped;
 
@@ -36,6 +37,28 @@ static struct imu_sample buf[BUF_SAMPLES];
 static int               buf_n;
 static char              flush_text[FLUSH_BUF_SIZE];
 static char              path_buf[64];
+static char              next_path_buf[64];
+static struct k_mutex    path_mtx;
+
+static const char        csv_header[] = "t_us,ax,ay,az,gx,gy,gz\n";
+
+static int swap_file_locked(const char *new_path)
+{
+	fs_close(&csv_file);
+
+	fs_file_t_init(&csv_file);
+	int ret = fs_open(&csv_file, new_path, FS_O_CREATE | FS_O_WRITE);
+	if (ret) {
+		LOG_ERR("sampler: rotate open %s: %d", new_path, ret);
+		return ret;
+	}
+	fs_write(&csv_file, csv_header, sizeof(csv_header) - 1);
+
+	strncpy(path_buf, new_path, sizeof(path_buf) - 1);
+	path_buf[sizeof(path_buf) - 1] = '\0';
+	LOG_INF("sampler: rotated → %s", new_path);
+	return 0;
+}
 
 static int flush_to_file(void)
 {
@@ -71,6 +94,28 @@ static void sampler_thread_fn(void *p1, void *p2, void *p3)
 		IMU_SAMPLER_RATE_HZ, path_buf);
 
 	while (!atomic_get(&samp_stop_req)) {
+		/* Honor a pending rotation: flush remaining samples, close old
+		 * file, open new file, write header. The sampler period is
+		 * 19 ms — adding ~50–150 ms of FATFS swap latency may delay
+		 * one or two samples but they aren't dropped (they sit in the
+		 * RAM buffer until the new file is open).
+		 */
+		if (atomic_get(&samp_rotate_req)) {
+			flush_to_file();
+			char path[64];
+			k_mutex_lock(&path_mtx, K_FOREVER);
+			strncpy(path, next_path_buf, sizeof(path) - 1);
+			path[sizeof(path) - 1] = '\0';
+			k_mutex_unlock(&path_mtx);
+
+			if (swap_file_locked(path) < 0) {
+				LOG_ERR("sampler: swap failed → stopping");
+				atomic_clear(&samp_rotate_req);
+				break;
+			}
+			atomic_clear(&samp_rotate_req);
+		}
+
 		int16_t a[3], g[3];
 		int ret = imu_read_xlg(a, g);
 		if (ret == 0) {
@@ -116,6 +161,8 @@ int imu_sampler_start(const char *csv_path)
 		return -EALREADY;
 	}
 
+	k_mutex_init(&path_mtx);
+
 	strncpy(path_buf, csv_path, sizeof(path_buf) - 1);
 	path_buf[sizeof(path_buf) - 1] = '\0';
 
@@ -126,13 +173,13 @@ int imu_sampler_start(const char *csv_path)
 		return ret;
 	}
 
-	static const char header[] = "t_us,ax,ay,az,gx,gy,gz\n";
-	fs_write(&csv_file, header, sizeof(header) - 1);
+	fs_write(&csv_file, csv_header, sizeof(csv_header) - 1);
 
 	samp_count   = 0;
 	samp_dropped = 0;
 	buf_n        = 0;
 	atomic_clear(&samp_stop_req);
+	atomic_clear(&samp_rotate_req);
 	atomic_set(&samp_running, 1);
 
 	k_tid_t tid = k_thread_create(&samp_thread, samp_stack,
@@ -149,6 +196,19 @@ int imu_sampler_stop(void)
 		return -ENOENT;
 	}
 	atomic_set(&samp_stop_req, 1);
+	return 0;
+}
+
+int imu_sampler_rotate(const char *new_csv_path)
+{
+	if (!atomic_get(&samp_running)) {
+		return -ENOENT;
+	}
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	strncpy(next_path_buf, new_csv_path, sizeof(next_path_buf) - 1);
+	next_path_buf[sizeof(next_path_buf) - 1] = '\0';
+	k_mutex_unlock(&path_mtx);
+	atomic_set(&samp_rotate_req, 1);
 	return 0;
 }
 

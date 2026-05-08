@@ -46,3 +46,13 @@ uint32_t audio_recorder_bytes_written(void);
  * to detect a silently-dead writer.
  */
 bool     audio_recorder_failed(void);
+
+/* Seamless mid-stream rotation: signal the writer thread to finalize the
+ * current file and open `new_path`. The DMIC keeps running across the
+ * swap; up to ~800 ms of audio is buffered in the PDM mem-slab so the
+ * swap is gap-free as long as it completes before the slab fills.
+ *
+ * Returns -ENOENT if no recorder running, 0 on request accepted (the
+ * actual swap happens on the recorder thread's next iteration).
+ */
+int      audio_recorder_rotate(const char *new_path);

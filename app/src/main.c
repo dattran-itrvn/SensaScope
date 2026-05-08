@@ -1,13 +1,15 @@
 /*
  * SensaPulse v1.0 firmware — main entry.
  *
- * Task #11: IMU CSV + meta.json wired alongside the audio recorder.
- *  - Boot probes peripherals (LED / battery / IMU / audio / SD / BLE).
- *  - Idle: heartbeat blink @ 1 Hz, LED off when idle (toggling = idle pattern).
- *  - Double-tap on body → toggle recording. Start writes meta.json once and
- *    fires both writers (audio.wav + imu.csv); stop signals both writers.
+ * Task #12: session manager owns folder lifecycle.
+ *  - Boot probes peripherals (LED / battery / IMU / audio / SD / BLE),
+ *    then session_init() reads or rebuilds the session counter from SD.
+ *  - Idle: heartbeat blink @ 1 Hz (toggling).
+ *  - Double-tap → session_start(): mkdir SESSION_NNNNN/, open audio/imu,
+ *    write meta.json + .unsynced, schedule 10-min rotation timer.
+ *  - Subsequent rotations are seamless inside the writer threads.
+ *  - Double-tap → session_stop(): cancel timer, close writers.
  *  - LED solid ON while recording (full FSM in task #13).
- *  - Folder rotation lives in task #12; for now files are flat at the SD root.
  */
 
 #include <zephyr/kernel.h>
@@ -28,9 +30,6 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 #define SMOKE_WAV_PATH    SD_MOUNT_POINT "/PDM_TEST.WAV"
 #define SMOKE_RECORD_S    3
-#define REC_WAV_PATH      SD_MOUNT_POINT "/REC.WAV"
-#define REC_CSV_PATH      SD_MOUNT_POINT "/REC.CSV"
-#define REC_META_PATH     SD_MOUNT_POINT "/META.JSON"
 
 /* ---------- BLE smoke advertise ---------- */
 static const struct bt_data adv_data[] = {
@@ -65,27 +64,17 @@ static int start_ble(void)
 /* ---------- Double-tap → toggle record ---------- */
 static void on_double_tap(void)
 {
-	if (audio_recorder_is_running() || imu_sampler_is_running()) {
-		LOG_INF(">>> DOUBLE TAP — stopping recording");
-		audio_recorder_stop();
-		imu_sampler_stop();
-		/* LED returns to idle after recorder threads finish (poll in main). */
+	if (session_is_active()) {
+		LOG_INF(">>> DOUBLE TAP — stopping session");
+		session_stop();
 		return;
 	}
 
-	LOG_INF(">>> DOUBLE TAP — starting recording");
+	LOG_INF(">>> DOUBLE TAP — starting session");
 	int batt_mv = battery_read_mv();
-	session_write_meta(REC_META_PATH, batt_mv);
-
-	int ret = audio_recorder_start(REC_WAV_PATH);
+	int ret = session_start(batt_mv);
 	if (ret) {
-		LOG_ERR("audio_recorder_start failed: %d", ret);
-		return;
-	}
-	ret = imu_sampler_start(REC_CSV_PATH);
-	if (ret) {
-		LOG_ERR("imu_sampler_start failed: %d — stopping audio", ret);
-		audio_recorder_stop();
+		LOG_ERR("session_start failed: %d", ret);
 		return;
 	}
 	led_on();   /* solid ON while recording */
@@ -118,6 +107,7 @@ int main(void)
 			LOG_INF("smoke ch0 (body, L)    peak=%d  mean=%d", pl, ml);
 			LOG_INF("smoke ch1 (ambient, R) peak=%d  mean=%d", pr, mr);
 		}
+		session_init();
 	}
 
 	start_ble();
@@ -126,13 +116,14 @@ int main(void)
 
 	bool prev_recording = false;
 	while (1) {
-		bool now_recording =
-			audio_recorder_is_running() || imu_sampler_is_running();
+		bool now_recording = session_is_active() ||
+			audio_recorder_is_running() ||
+			imu_sampler_is_running();
 		if (now_recording) {
 			led_on();   /* solid ON while recording */
 		} else {
 			if (prev_recording) {
-				LOG_INF("Stopped: audio=%u B, imu=%u samples",
+				LOG_INF("Stopped: audio_last=%u B, imu_last=%u samples",
 					audio_recorder_bytes_written(),
 					imu_sampler_samples_written());
 			}

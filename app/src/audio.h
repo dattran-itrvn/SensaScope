@@ -39,3 +39,10 @@ int      audio_recorder_start(const char *path);
 int      audio_recorder_stop(void);
 bool     audio_recorder_is_running(void);
 uint32_t audio_recorder_bytes_written(void);
+
+/* True if the writer thread exited because of an error (dmic_read,
+ * dmic_trigger, fs_write, configure_dmic) rather than a stop request.
+ * Cleared on the next audio_recorder_start. Used by the session manager
+ * to detect a silently-dead writer.
+ */
+bool     audio_recorder_failed(void);

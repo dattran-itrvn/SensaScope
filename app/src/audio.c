@@ -11,7 +11,11 @@ LOG_MODULE_REGISTER(audio, LOG_LEVEL_INF);
 #define PDM_BLOCK_MS      100
 #define PDM_BLOCK_SAMPLES (AUDIO_PDM_RATE_HZ * PDM_BLOCK_MS / 1000)
 #define PDM_BLOCK_BYTES   (PDM_BLOCK_SAMPLES * AUDIO_PDM_CHANNELS * sizeof(int16_t))
-#define PDM_BLOCK_COUNT   4
+/* 8 blocks × 100 ms = ~800 ms slack before a missed block. Bumped from 4
+ * after observing a 343 ms gap in IMU CSV that pointed at SD card write
+ * latency spikes — 4 blocks (~400 ms) was on the edge.
+ */
+#define PDM_BLOCK_COUNT   8
 
 K_MEM_SLAB_DEFINE_STATIC(pdm_slab, PDM_BLOCK_BYTES, PDM_BLOCK_COUNT, 4);
 
@@ -173,8 +177,13 @@ static struct k_thread rec_thread;
 static k_tid_t         rec_tid;
 
 static struct fs_file_t rec_file;
-static atomic_t         rec_running = ATOMIC_INIT(0);
+static atomic_t         rec_running  = ATOMIC_INIT(0);
 static atomic_t         rec_stop_req = ATOMIC_INIT(0);
+/* Set by the writer thread when it exits because of an error rather than
+ * a stop request. Lets a watchdog (session manager / main FSM) tell a
+ * crashed writer apart from a clean stop.
+ */
+static atomic_t         rec_failed   = ATOMIC_INIT(0);
 static volatile uint32_t rec_bytes;
 static char             rec_path_buf[64];
 
@@ -186,12 +195,14 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3)
 	ret = configure_dmic();
 	if (ret < 0) {
 		LOG_ERR("recorder: dmic_configure failed: %d", ret);
+		atomic_set(&rec_failed, 1);
 		goto out_close;
 	}
 
 	ret = dmic_trigger(dmic_dev, DMIC_TRIGGER_START);
 	if (ret < 0) {
 		LOG_ERR("recorder: trigger START failed: %d", ret);
+		atomic_set(&rec_failed, 1);
 		goto out_close;
 	}
 	LOG_INF("recorder: streaming → %s", rec_path_buf);
@@ -205,12 +216,16 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3)
 
 		ret = dmic_read(dmic_dev, 0, &buf, &size, 500);
 		if (ret < 0) {
-			LOG_ERR("recorder: dmic_read failed: %d", ret);
+			LOG_ERR("recorder: dmic_read failed at %u B / %u blocks: %d",
+				rec_bytes, blocks, ret);
+			atomic_set(&rec_failed, 1);
 			break;
 		}
 		ret = fs_write(&rec_file, buf, size);
 		if (ret < 0) {
-			LOG_ERR("recorder: fs_write failed: %d", ret);
+			LOG_ERR("recorder: fs_write failed at %u B / %u blocks: %d",
+				rec_bytes, blocks, ret);
+			atomic_set(&rec_failed, 1);
 			k_mem_slab_free(&pdm_slab, buf);
 			break;
 		}
@@ -252,6 +267,7 @@ int audio_recorder_start(const char *path)
 
 	rec_bytes = 0;
 	atomic_clear(&rec_stop_req);
+	atomic_clear(&rec_failed);
 	atomic_set(&rec_running, 1);
 
 	rec_tid = k_thread_create(&rec_thread, rec_stack,
@@ -274,6 +290,11 @@ int audio_recorder_stop(void)
 bool audio_recorder_is_running(void)
 {
 	return atomic_get(&rec_running) != 0;
+}
+
+bool audio_recorder_failed(void)
+{
+	return atomic_get(&rec_failed) != 0;
 }
 
 uint32_t audio_recorder_bytes_written(void)

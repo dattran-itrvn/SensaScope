@@ -82,6 +82,13 @@ After each phase closes, update this section with what we learned:
 - **Source of variance**: SDK / hardware quirks not documented anywhere, only discoverable by hitting the error. After capturing them in `CLAUDE.md`, future tasks should pay this cost less often.
 - **Action item**: For v1.0 remaining and v1.1, multiply Cowork's first-pass estimate by 1.3× as a default safety margin until we accumulate ≥ 5 closed tasks of new data.
 
+### Tooling lessons (cumulative — read before authoring playbooks)
+
+- **JLinkRTTLogger standalone is not reliable on macOS Apple Silicon.** It connects to the J-Link, but its auto-search for the SEGGER RTT control block silently fails (reports `RTT Control Block not found`) even when the block is present at a normal SRAM address (verified: `_SEGGER_RTT` at `0x20001010`, magic `"SEGGER RTT"` correct, WrOff advancing). Symptom looks like firmware crash but isn't. Cost so far: ~0.75 h on task #11 chasing a ghost.
+- **Use the 2-process pattern instead** (`scripts/rtt_capture.sh`): keep `JLinkExe` alive in the background as a gateway (`-RTTTelnetPort 19021`), then attach `JLinkRTTClient` to that gateway. The client reads from the gateway's already-discovered RTT block and just works.
+- **macOS ships no GNU `timeout`** by default. For bounded captures use the background-`&` + `sleep` + `kill` pattern, not `timeout DURATION cmd`. Either install `coreutils` (`gtimeout`) or stick with the manual pattern — `rtt_capture.sh` does the latter.
+- **Implication for overnight playbooks**: any `run_loop.py` step that captures RTT must go through `scripts/rtt_capture.sh`, never call `JLinkRTTLogger` directly. Document this in `playbooks/README.md` if a contributor reaches for the lower-level tool.
+
 ### v1.0 remaining (open)
 
 (Fill in when closed.)

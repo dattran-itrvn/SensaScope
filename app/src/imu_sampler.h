@@ -20,3 +20,9 @@ int      imu_sampler_start(const char *csv_path);
 int      imu_sampler_stop(void);
 bool     imu_sampler_is_running(void);
 uint32_t imu_sampler_samples_written(void);
+
+/* Mid-stream file swap. Sampler thread flushes pending samples to the
+ * old file, closes it, opens new_path, writes the CSV header, and
+ * resumes. Returns 0 on request accepted (swap happens at next iteration).
+ */
+int      imu_sampler_rotate(const char *new_csv_path);

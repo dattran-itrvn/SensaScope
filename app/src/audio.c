@@ -173,10 +173,38 @@ static struct k_thread rec_thread;
 static k_tid_t         rec_tid;
 
 static struct fs_file_t rec_file;
-static atomic_t         rec_running = ATOMIC_INIT(0);
-static atomic_t         rec_stop_req = ATOMIC_INIT(0);
+static atomic_t         rec_running    = ATOMIC_INIT(0);
+static atomic_t         rec_stop_req   = ATOMIC_INIT(0);
+static atomic_t         rec_rotate_req = ATOMIC_INIT(0);
 static volatile uint32_t rec_bytes;
 static char             rec_path_buf[64];
+static char             rec_next_path[64];
+static struct k_mutex   rec_path_mtx;
+
+/* Finalize current WAV (write header with size) and reopen at new_path
+ * with a placeholder header. Called from inside the recorder thread only.
+ */
+static int swap_file_locked(const char *new_path)
+{
+	write_wav_header(&rec_file, rec_bytes);
+	fs_close(&rec_file);
+	LOG_INF("recorder: rotated, %u B closed → reopen %s",
+		rec_bytes, new_path);
+
+	fs_file_t_init(&rec_file);
+	int ret = fs_open(&rec_file, new_path, FS_O_CREATE | FS_O_WRITE);
+	if (ret) {
+		LOG_ERR("recorder: rotate open %s: %d", new_path, ret);
+		return ret;
+	}
+	uint8_t pad[44] = {0};
+	fs_write(&rec_file, pad, sizeof(pad));
+	rec_bytes = 0;
+
+	strncpy(rec_path_buf, new_path, sizeof(rec_path_buf) - 1);
+	rec_path_buf[sizeof(rec_path_buf) - 1] = '\0';
+	return 0;
+}
 
 static void recorder_thread_fn(void *p1, void *p2, void *p3)
 {
@@ -200,6 +228,25 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3)
 	uint32_t blocks = 0;
 
 	while (!atomic_get(&rec_stop_req)) {
+		/* Honor a pending rotation request before reading the next block,
+		 * so the just-arriving block lands in the new file. The mem-slab
+		 * holds up to ~400 ms of audio, well above FATFS swap latency.
+		 */
+		if (atomic_get(&rec_rotate_req)) {
+			char path[64];
+			k_mutex_lock(&rec_path_mtx, K_FOREVER);
+			strncpy(path, rec_next_path, sizeof(path) - 1);
+			path[sizeof(path) - 1] = '\0';
+			k_mutex_unlock(&rec_path_mtx);
+
+			if (swap_file_locked(path) < 0) {
+				LOG_ERR("recorder: swap failed → stopping");
+				atomic_clear(&rec_rotate_req);
+				break;
+			}
+			atomic_clear(&rec_rotate_req);
+		}
+
 		void *buf;
 		uint32_t size;
 
@@ -238,6 +285,8 @@ int audio_recorder_start(const char *path)
 		return -EALREADY;
 	}
 
+	k_mutex_init(&rec_path_mtx);
+
 	strncpy(rec_path_buf, path, sizeof(rec_path_buf) - 1);
 	rec_path_buf[sizeof(rec_path_buf) - 1] = '\0';
 
@@ -252,6 +301,7 @@ int audio_recorder_start(const char *path)
 
 	rec_bytes = 0;
 	atomic_clear(&rec_stop_req);
+	atomic_clear(&rec_rotate_req);
 	atomic_set(&rec_running, 1);
 
 	rec_tid = k_thread_create(&rec_thread, rec_stack,
@@ -268,6 +318,19 @@ int audio_recorder_stop(void)
 		return -ENOENT;
 	}
 	atomic_set(&rec_stop_req, 1);
+	return 0;
+}
+
+int audio_recorder_rotate(const char *new_path)
+{
+	if (!atomic_get(&rec_running)) {
+		return -ENOENT;
+	}
+	k_mutex_lock(&rec_path_mtx, K_FOREVER);
+	strncpy(rec_next_path, new_path, sizeof(rec_next_path) - 1);
+	rec_next_path[sizeof(rec_next_path) - 1] = '\0';
+	k_mutex_unlock(&rec_path_mtx);
+	atomic_set(&rec_rotate_req, 1);
 	return 0;
 }
 

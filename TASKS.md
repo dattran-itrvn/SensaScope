@@ -50,21 +50,23 @@ Configure `TAP_CFG`/`TAP_THS_6D`/`INT_DUR2`/`WAKE_UP_THS`/`MD1_CFG` per AN5040 r
 **#10 ✅ Streaming WAV writer + start/stop API**
 `audio_recorder_start(path)` / `audio_recorder_stop()` async API. Writer thread (4 KB stack, prio 5) reads PDM blocks via DMIC, writes to file, accumulates byte count. On stop: finalize 44-byte WAV header at offset 0, close file. Verified streaming 14 s = 896000 B exactly (no drops, ~62 kB/s).
 
-**#11 ⏳ IMU CSV writer + meta.json**
+**#11 ✅ IMU CSV writer + meta.json**
 - New module `imu_sampler.c/h`. Sample LSM6DSL accel + gyro at **52 Hz** via blocking read or hardware FIFO.
 - CSV header: `t_us,ax,ay,az,gx,gy,gz`. Raw LSB units, NO calibration in firmware.
 - Buffer ~1 s of samples in RAM, then flush in a single `fs_write` call (reduces FATFS overhead).
 - `meta.json` written once per session with: `start_rtc_ms` (currently `k_uptime_get()` since RTC isn't wired), `fs_audio=16000`, `fs_imu=52`, `fw_version`, `batt_mv_start`, `build_hash` (commit short SHA), `device_name`, `chip_id`.
 - Hook into existing `audio_recorder_start/stop` so all three writers come up/tear down together.
 - Smoke test: 30 s recording → check audio.wav + imu.csv + meta.json all on SD, all valid.
+- **Verified** with healthy SD card: 0 CRC errors, audio↔IMU sync drift 73 ms, IMU effective rate 51.97 Hz, no embedded NUL bytes. Initial test failed with a worn card masking writes silently — see `docs/TIMING.md` Tooling lessons.
 
-**#12 ⏳ Session manager + 10-min rotation**
+**#12 ✅ Session manager + 10-min rotation**
 - New module `session.c/h` owning the lifecycle of a session folder.
 - On `session_start()`: pick next sequential id (counter persisted in `/SD/sync_state.json`), `mkdir /SD/SESSION_NNNNN/`, open `audio.wav` + `imu.csv` + `meta.json`, touch `.unsynced` marker.
 - Internal timer fires at +10 min: `session_rotate()` — close current, open next. Must be **seamless** (no audio gap > 1 PDM block ≈ 100 ms).
 - On `session_stop()` (double-tap): close files, finalize WAV header, write final meta.json fields.
 - Free-space management (overlaps with #17 below): pre-flight check before opening new folder. If <100 MB free *and* synced folders exist → evict oldest. If <100 MB *and no* synced folders → enter ERROR state (LED SOS, refuse new recording).
 - Tests: trigger rotation manually (shorten timer to 30 s temporarily), verify 2-3 consecutive folders all valid.
+- **Verified** with healthy SD card alongside #11. Also added a 1 Hz watchdog (`monitor_work_handler`) that aborts the session if either writer thread dies silently — caught the worn-SD failure mode where audio recorder exited mid-stream but IMU sampler kept running.
 
 **#13 ⏳ LED state machine**
 - Refactor `led.c/h` from current toggle helpers to `led_set_state(led_state_t)` API.

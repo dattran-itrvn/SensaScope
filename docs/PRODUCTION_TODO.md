@@ -30,6 +30,7 @@ The current sync protocol is **unauthenticated and unencrypted** at the applicat
 - [ ] **Watchdog** — `CONFIG_WDT=y` + 10s timeout. Force reboot if main loop hangs.
 - [ ] **FATFS power-fail recovery** — switch to journaled FS or do `f_sync()` after each WAV block (cost: more SD wear, but safer).
 - [ ] **SD card health monitoring** — track write errors over time, disable card and warn user via BLE if error rate spikes.
+- [ ] **SD card CRC error rate monitor** — log error count per session, abort + LED warn if >0 in production. Worn cards corrupt data silently and FATFS retries can mask it long enough that hours of audio look fine in metadata but contain NUL runs or truncated tails. Diagnosed during #11/#12 bring-up: a worn card produced 2.4 s of audio versus 50 s of IMU before the watchdog caught the divergence.
 - [ ] **Battery sag protection** — when VBATT drops below 3.3V *during recording*, finalize current session cleanly before LDO drops out.
 
 ## Hardware / PCB v1.1+

@@ -37,12 +37,12 @@ Units: hours. 1 working day = 8 h. Use decimals (e.g. 0.5 h, 2.5 h).
 
 | # | Task | Estimate (h) | Actual (h) | Variance | Notes |
 |---|---|---|---|---|---|
-| 11 | IMU CSV + meta.json | 3 | — | — | |
-| 12 | Session manager + 10-min rotation | 6 | — | — | Rotation seamlessness is the unknown. Budget extra here. |
+| 11 | IMU CSV + meta.json | 3 | 3 | 0 % | Implementation clean. The 73 ms audio↔IMU sync drift and 51.97 Hz effective rate were only visible from post-mortem analysis of the CSV against `audio.wav` — not from RTT logs. Build the verification step into the workflow, not into the firmware. |
+| 12 | Session manager + 10-min rotation | 6 | 3 | -50 % | Rotation timer + persistent counter + watchdog all fit in one batch — simpler than the "rotation seamlessness" framing implied because the existing audio + imu writer threads already had the right hooks (mid-loop atomic check, ring-buffered samples). The slack came from #11 having shown the writer-coordination pattern already. |
 | 13 | LED state machine | 1.5 | — | — | |
 | 14 | Main state machine + integration | 3 | — | — | |
 | 15 | Python session loader | 0.5 | — | — | |
-| **v1.0 remaining subtotal** | | **14 h** | | | |
+| **v1.0 remaining subtotal** | | **14 h** | **6 h (so far)** | | |
 
 ---
 
@@ -88,10 +88,14 @@ After each phase closes, update this section with what we learned:
 - **Use the 2-process pattern instead** (`scripts/rtt_capture.sh`): keep `JLinkExe` alive in the background as a gateway (`-RTTTelnetPort 19021`), then attach `JLinkRTTClient` to that gateway. The client reads from the gateway's already-discovered RTT block and just works.
 - **macOS ships no GNU `timeout`** by default. For bounded captures use the background-`&` + `sleep` + `kill` pattern, not `timeout DURATION cmd`. Either install `coreutils` (`gtimeout`) or stick with the manual pattern — `rtt_capture.sh` does the latter.
 - **Implication for overnight playbooks**: any `run_loop.py` step that captures RTT must go through `scripts/rtt_capture.sh`, never call `JLinkRTTLogger` directly. Document this in `playbooks/README.md` if a contributor reaches for the lower-level tool.
+- **SD card hardware failure modes are diagnosable only by RTT log + post-mortem file analysis.** During #11/#12 a worn card produced 2.4 s of `audio.wav` while `imu.csv` ran 50 s — symptom looked like a firmware race, was actually `dmic_read`/`fs_write` failing under FATFS retries with the card silently corrupting writes. Always check (1) CRC error count exposed by the card, (2) embedded NUL runs in the captured WAV, (3) audio↔IMU sync drift, when verifying long recordings. Old/worn cards can fail without surfacing any error code from FATFS. Mitigations now in firmware: writer-death watchdog (session.c) + bigger PDM mem-slab (audio.c, ~800 ms slack). Production-side mitigation lives in `docs/PRODUCTION_TODO.md` § Reliability.
 
 ### v1.0 remaining (open)
 
-(Fill in when closed.)
+- **Sample size so far**: 2 of 5 tasks closed (#11, #12). #11 hit estimate dead-on; #12 came in 50 % under.
+- **Trend**: the 1.3× safety margin from the bring-up phase looks too conservative for tasks where the unknowns are well-bounded by existing module APIs (audio/imu start/stop hooks already gave session.c clean integration points). When the next task plugs into stable interfaces, drop the margin to 1.0×; reserve the 1.3× for tasks that introduce new peripherals or new SDK surface area.
+- **Watch-out**: hardware-side variance (SD card health, mic placement, battery sag) is invisible to the estimate — it shows up as test-iteration cost, not implementation cost. Estimate the *firmware* work; treat hardware-debug iterations as a separate budget line.
+- (Fill in #13–#15 when closed.)
 
 ### v1.1 (open)
 

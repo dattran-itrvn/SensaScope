@@ -35,6 +35,7 @@ static uint32_t      next_id      = 1;
 static uint32_t      current_id   = 0;
 static int           batt_at_start;
 static bool          active;
+static bool          aborted;       /* set by monitor; cleared by session_start */
 static uint32_t      rotate_sec   = SESSION_ROTATE_SEC_DEFAULT;
 static struct k_timer rotate_timer;
 static struct k_work  rotate_work;
@@ -292,7 +293,8 @@ static void monitor_work_handler(struct k_work *w)
 	 * would re-stop our own timers, and we're already running on the
 	 * system work queue.
 	 */
-	active = false;
+	aborted = true;
+	active  = false;
 	k_timer_stop(&rotate_timer);
 	k_timer_stop(&monitor_timer);
 	if (audio_alive) audio_recorder_stop();
@@ -368,7 +370,8 @@ int session_start(int batt_mv)
 	current_id = id;
 	next_id    = id + 1;
 	save_counter(next_id);
-	active = true;
+	aborted = false;
+	active  = true;
 
 	k_timer_start(&rotate_timer, K_SECONDS(rotate_sec),
 		      K_SECONDS(rotate_sec));
@@ -403,5 +406,6 @@ int session_stop(void)
 	return 0;
 }
 
-bool session_is_active(void)        { return active; }
+bool     session_is_active(void)    { return active; }
+bool     session_was_aborted(void)  { return aborted; }
 uint32_t session_current_id(void)   { return current_id; }

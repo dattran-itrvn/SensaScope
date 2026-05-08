@@ -1,15 +1,11 @@
 /*
  * SensaPulse v1.0 firmware — main entry.
  *
- * Task #12: session manager owns folder lifecycle.
- *  - Boot probes peripherals (LED / battery / IMU / audio / SD / BLE),
- *    then session_init() reads or rebuilds the session counter from SD.
- *  - Idle: heartbeat blink @ 1 Hz (toggling).
- *  - Double-tap → session_start(): mkdir SESSION_NNNNN/, open audio/imu,
- *    write meta.json + .unsynced, schedule 10-min rotation timer.
- *  - Subsequent rotations are seamless inside the writer threads.
- *  - Double-tap → session_stop(): cancel timer, close writers.
- *  - LED solid ON while recording (full FSM in task #13).
+ * Task #13: LED driven by state-engine. The legacy on/off/toggle calls
+ *           are replaced with led_set_state(LED_STATE_*); the pattern
+ *           timer in led.c owns the GPIO writes.
+ * (Task #14 will replace this main-loop polling with a real FSM that
+ *  also drives LOW_BATT_HOLDOFF and ERROR states.)
  */
 
 #include <zephyr/kernel.h>
@@ -77,7 +73,7 @@ static void on_double_tap(void)
 		LOG_ERR("session_start failed: %d", ret);
 		return;
 	}
-	led_on();   /* solid ON while recording */
+	led_set_state(LED_STATE_RECORDING);
 }
 
 /* ---------- main ---------- */
@@ -112,6 +108,7 @@ int main(void)
 
 	start_ble();
 
+	led_set_state(LED_STATE_IDLE);
 	LOG_INF("Idle. Double-tap to start/stop recording.");
 
 	bool prev_recording = false;
@@ -119,15 +116,15 @@ int main(void)
 		bool now_recording = session_is_active() ||
 			audio_recorder_is_running() ||
 			imu_sampler_is_running();
-		if (now_recording) {
-			led_on();   /* solid ON while recording */
-		} else {
-			if (prev_recording) {
+		if (now_recording != prev_recording) {
+			if (now_recording) {
+				led_set_state(LED_STATE_RECORDING);
+			} else {
 				LOG_INF("Stopped: audio_last=%u B, imu_last=%u samples",
 					audio_recorder_bytes_written(),
 					imu_sampler_samples_written());
+				led_set_state(LED_STATE_IDLE);
 			}
-			led_toggle();  /* idle: heartbeat blink */
 		}
 		prev_recording = now_recording;
 		k_msleep(500);

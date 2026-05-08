@@ -39,6 +39,15 @@ static uint32_t      rotate_sec   = SESSION_ROTATE_SEC_DEFAULT;
 static struct k_timer rotate_timer;
 static struct k_work  rotate_work;
 
+/* Monitor watchdog. Fires once per second while a session is active and
+ * aborts if either writer thread has silently exited (e.g. audio recorder
+ * hit dmic_read/fs_write error and left rec_running=0 while the IMU
+ * sampler kept going — the bug Cowork caught in #11 testing).
+ */
+#define MONITOR_INTERVAL_SEC  1
+static struct k_timer monitor_timer;
+static struct k_work  monitor_work;
+
 /* ---------- Helpers ---------- */
 static void chip_id_hex(char *out, size_t n)
 {
@@ -258,11 +267,52 @@ static void rotate_timer_cb(struct k_timer *t)
 	k_work_submit(&rotate_work);
 }
 
+/* ---------- Watchdog ---------- */
+static void monitor_work_handler(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	if (!active) return;
+
+	bool audio_alive  = audio_recorder_is_running();
+	bool audio_failed = audio_recorder_failed();
+	bool imu_alive    = imu_sampler_is_running();
+
+	if (audio_alive && imu_alive) {
+		return;  /* healthy */
+	}
+
+	LOG_ERR("monitor: writer died — aborting SESSION_%05u "
+		"(audio_alive=%d audio_failed=%d imu_alive=%d, "
+		"audio=%u B, imu=%u samples)",
+		current_id, audio_alive, audio_failed, imu_alive,
+		audio_recorder_bytes_written(),
+		imu_sampler_samples_written());
+
+	/* Inline the cleanup — we can't call session_stop() because that
+	 * would re-stop our own timers, and we're already running on the
+	 * system work queue.
+	 */
+	active = false;
+	k_timer_stop(&rotate_timer);
+	k_timer_stop(&monitor_timer);
+	if (audio_alive) audio_recorder_stop();
+	if (imu_alive)   imu_sampler_stop();
+	current_id = 0;
+}
+
+static void monitor_timer_cb(struct k_timer *t)
+{
+	ARG_UNUSED(t);
+	k_work_submit(&monitor_work);
+}
+
 /* ---------- Public API ---------- */
 int session_init(void)
 {
 	k_work_init(&rotate_work, rotate_work_handler);
 	k_timer_init(&rotate_timer, rotate_timer_cb, NULL);
+	k_work_init(&monitor_work, monitor_work_handler);
+	k_timer_init(&monitor_timer, monitor_timer_cb, NULL);
 
 	if (load_counter(&next_id) == 0) {
 		LOG_INF("counter loaded, next_id=%u", next_id);
@@ -322,6 +372,8 @@ int session_start(int batt_mv)
 
 	k_timer_start(&rotate_timer, K_SECONDS(rotate_sec),
 		      K_SECONDS(rotate_sec));
+	k_timer_start(&monitor_timer, K_SECONDS(MONITOR_INTERVAL_SEC),
+		      K_SECONDS(MONITOR_INTERVAL_SEC));
 
 	LOG_INF("session_start: SESSION_%05u, rotate every %u s, batt=%d mV",
 		id, rotate_sec, batt_mv);
@@ -332,7 +384,13 @@ int session_stop(void)
 {
 	if (!active) return -ENOENT;
 
+	/* Set inactive first so a monitor work item already queued sees it
+	 * and skips immediately — avoids a spurious "writer died" abort
+	 * while the writer threads are winding down on their stop_req.
+	 */
+	active = false;
 	k_timer_stop(&rotate_timer);
+	k_timer_stop(&monitor_timer);
 
 	int ra = audio_recorder_stop();
 	int ri = imu_sampler_stop();
@@ -341,7 +399,6 @@ int session_stop(void)
 
 	uint32_t closed = current_id;
 	current_id = 0;
-	active = false;
 	LOG_INF("session_stop: closed SESSION_%05u", closed);
 	return 0;
 }

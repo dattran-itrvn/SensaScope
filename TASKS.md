@@ -68,19 +68,21 @@ Configure `TAP_CFG`/`TAP_THS_6D`/`INT_DUR2`/`WAKE_UP_THS`/`MD1_CFG` per AN5040 r
 - Tests: trigger rotation manually (shorten timer to 30 s temporarily), verify 2-3 consecutive folders all valid.
 - **Verified** with healthy SD card alongside #11. Also added a 1 Hz watchdog (`monitor_work_handler`) that aborts the session if either writer thread dies silently — caught the worn-SD failure mode where audio recorder exited mid-stream but IMU sampler kept running.
 
-**#13 ⏳ LED state machine**
+**#13 ✅ LED state machine**
 - Refactor `led.c/h` from current toggle helpers to `led_set_state(led_state_t)` API.
 - States: `IDLE` (1 Hz blink, ~10 % duty), `RECORDING` (solid on), `SYNC` (2 Hz blink, ~50 % duty — preview for v1.1), `LOW_BATT` (5 Hz blink), `ERROR` (SOS Morse — `... --- ...`).
 - Implementation via `k_timer` callback firing every 100 ms, walking a state-specific pattern.
 - Main thread or peripheral modules call `led_set_state()` to transition; LED module owns actual GPIO writes.
 - Smoke test: drive each state from a small test harness, eyeball pattern correctness.
+- **Verified** end-to-end alongside #14 on charged battery: LED follows IDLE / RECORDING / LOW_BATT / ERROR transitions with the right cadence by eyeball.
 
-**#14 ⏳ Main state machine + integration**
+**#14 ✅ Main state machine + integration**
 - Replace the current "boot tests then idle blink" main flow with a real state machine:
   - `STATE_IDLE`: LED idle pattern. Listening for double-tap (→ `RECORDING`) and (v1.1) BLE connect (→ `SYNC`).
   - `STATE_RECORDING`: LED solid. Session writers running. Double-tap stops → returns to IDLE. Battery monitor every 30 s; if `< 3300 mV` → auto-stop session and transition to `STATE_LOW_BATT_HOLDOFF` (LED low_batt pattern, ignore taps).
   - `STATE_ERROR`: LED SOS. Reached when SD full + no synced folders, or unrecoverable FATFS error.
 - Wire #11/#12/#13 modules together. Verify start/stop via double-tap, rotation seamless, LED follows state.
+- **Verified** with charged battery (4098 mV at start). 37.1 s recording: audio↔IMU drift 73 ms, IMU `fs_eff=51.96 Hz`, max IMU sample gap 32 ms, 0 NUL bytes in WAV. Session counter persisted across reboot (`session_id=3`). Build hash from feat branch tip stamped into meta.json correctly.
 
 **#15 ✅ Python session loader (PC tool)**
 - `tools/load_session.py` — `load_session(path: Path) -> dict`:

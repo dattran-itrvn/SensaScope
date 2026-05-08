@@ -39,10 +39,10 @@ Units: hours. 1 working day = 8 h. Use decimals (e.g. 0.5 h, 2.5 h).
 |---|---|---|---|---|---|
 | 11 | IMU CSV + meta.json | 3 | 3 | 0 % | Implementation clean. The 73 ms audio↔IMU sync drift and 51.97 Hz effective rate were only visible from post-mortem analysis of the CSV against `audio.wav` — not from RTT logs. Build the verification step into the workflow, not into the firmware. |
 | 12 | Session manager + 10-min rotation | 6 | 3 | -50 % | Rotation timer + persistent counter + watchdog all fit in one batch — simpler than the "rotation seamlessness" framing implied because the existing audio + imu writer threads already had the right hooks (mid-loop atomic check, ring-buffered samples). The slack came from #11 having shown the writer-coordination pattern already. |
-| 13 | LED state machine | 1.5 | — | — | |
-| 14 | Main state machine + integration | 3 | — | — | |
+| 13 | LED state machine | 1.5 | 1.0 | -33 % | Pattern table + 100 ms tick engine simpler than expected. SOS Morse fit in a 32-byte array, no per-state state machine needed. |
+| 14 | Main state machine + integration | 3 | 2.0 | -33 % | State enum + transitions wired into existing module APIs (session.c watchdog from #12 already detected aborts; battery_read_mv from #7 already classified). FSM was mostly composition. |
 | 15 | Python session loader | 0.5 | 0.5 | 0 % | Stdlib `wave` + numpy + pandas; spec said scipy but scipy is heavy and not in the dev env. Smoke against uploaded fixture matched Cowork's drift / fs_eff numbers exactly. |
-| **v1.0 remaining subtotal** | | **14 h** | **6.5 h (so far)** | | |
+| **v1.0 remaining subtotal** | | **14 h** | **9.5 h** | -32 % | |
 
 ---
 
@@ -90,12 +90,13 @@ After each phase closes, update this section with what we learned:
 - **Implication for overnight playbooks**: any `run_loop.py` step that captures RTT must go through `scripts/rtt_capture.sh`, never call `JLinkRTTLogger` directly. Document this in `playbooks/README.md` if a contributor reaches for the lower-level tool.
 - **SD card hardware failure modes are diagnosable only by RTT log + post-mortem file analysis.** During #11/#12 a worn card produced 2.4 s of `audio.wav` while `imu.csv` ran 50 s — symptom looked like a firmware race, was actually `dmic_read`/`fs_write` failing under FATFS retries with the card silently corrupting writes. Always check (1) CRC error count exposed by the card, (2) embedded NUL runs in the captured WAV, (3) audio↔IMU sync drift, when verifying long recordings. Old/worn cards can fail without surfacing any error code from FATFS. Mitigations now in firmware: writer-death watchdog (session.c) + bigger PDM mem-slab (audio.c, ~800 ms slack). Production-side mitigation lives in `docs/PRODUCTION_TODO.md` § Reliability.
 
-### v1.0 remaining (open)
+### v1.0 remaining (closed)
 
-- **Sample size so far**: 2 of 5 tasks closed (#11, #12). #11 hit estimate dead-on; #12 came in 50 % under.
-- **Trend**: the 1.3× safety margin from the bring-up phase looks too conservative for tasks where the unknowns are well-bounded by existing module APIs (audio/imu start/stop hooks already gave session.c clean integration points). When the next task plugs into stable interfaces, drop the margin to 1.0×; reserve the 1.3× for tasks that introduce new peripherals or new SDK surface area.
-- **Watch-out**: hardware-side variance (SD card health, mic placement, battery sag) is invisible to the estimate — it shows up as test-iteration cost, not implementation cost. Estimate the *firmware* work; treat hardware-debug iterations as a separate budget line.
-- (Fill in #13–#15 when closed.)
+- **All 5 tasks closed**: #11 = 0 %, #12 = -50 %, #13 = -33 %, #14 = -33 %, #15 = 0 %.
+- **Phase variance**: -32 % (9.5 h actual vs 14 h estimate). Bring-up was +39 %; v1.0 remaining was -32 %. The flip makes sense: bring-up paid for SDK/hardware unknowns once; v1.0 remaining was almost pure composition over already-stable APIs.
+- **Calibration update**: drop the 1.3× safety margin for tasks plugging into stable module interfaces. Keep it (and add a hardware-debug budget line) for tasks that introduce a new peripheral or a new SDK subsystem (PDM, BLE, USB).
+- **For v1.1**: BLE GATT (#19, est. 24 h) is the only task that introduces new SDK surface area. Apply 1.3× to that one and leave the rest at 1.0×.
+- **Hardware-debug iterations were a separate budget line.** Worn-SD chase cost ~1 h, J-Link RTT chase ~0.75 h. Both are now captured in `Tooling lessons` so future-us pays once.
 
 ### v1.1 (open)
 

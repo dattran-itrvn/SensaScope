@@ -13,10 +13,35 @@ static const struct gpio_dt_spec led_spec =
 /* Each pattern is a sequence of 0/1 entries, one per TICK_MS. The engine
  * advances `tick` and writes pattern[tick % len]. Periods are sized so
  * `len * TICK_MS` is the visible cadence.
+ *
+ * Power-aware redesign (task #22): IDLE and RECORDING are now sparse
+ * heartbeats so the LED no longer dominates the average current draw
+ * when wearing the device 24/7. Patterns chosen to be visually
+ * distinguishable at a glance:
+ *   IDLE       → single 100 ms pulse every 3 s     (~3.3 % duty)
+ *   RECORDING  → two 100 ms pulses 200 ms apart,
+ *                then dark 4.7 s                    (~4 % duty)
+ * Old solid-on RECORDING burned ~13 mA continuous; new pattern is
+ * ~0.5 mA average, ≈ 25× saving. LOW_BATT / ERROR / SYNC keep their
+ * stronger cadences (those states are short-lived or alarming).
  */
 static const uint8_t p_off[]       = { 0 };
-static const uint8_t p_idle[]      = { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 };  /* 1 Hz, 10 % */
-static const uint8_t p_recording[] = { 1 };                              /* solid */
+static const uint8_t p_idle[]      = {
+	1,                                         /* 100 ms ON                */
+	0, 0, 0, 0, 0, 0, 0, 0, 0,                 /* 900 ms OFF               */
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,              /* 1.0  s OFF               */
+	0, 0, 0, 0, 0, 0, 0, 0, 0,                 /* 900 ms OFF (total ≈3 s)  */
+};
+static const uint8_t p_recording[] = {
+	1,                                         /* pulse 1 (100 ms)         */
+	0, 0,                                      /* gap (200 ms)             */
+	1,                                         /* pulse 2 (100 ms)         */
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,              /* 1.0  s OFF               */
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,              /* 1.0  s OFF               */
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,              /* 1.0  s OFF               */
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,              /* 1.0  s OFF               */
+	0, 0, 0, 0, 0, 0, 0,                       /* 700 ms OFF (total ≈5.1s) */
+};
 static const uint8_t p_sync[]      = { 1, 1, 0, 0, 0 };                  /* 2 Hz, 40 % */
 static const uint8_t p_low_batt[]  = { 1, 0 };                           /* 5 Hz, 50 % */
 /* SOS Morse at 1 unit = 1 tick: ...---... with 3-tick letter gaps and a

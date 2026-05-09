@@ -1,15 +1,16 @@
 #include <zephyr/kernel.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/logging/log.h>
-#include <soc.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "audio.h"
+#include "device_id.h"
 #include "imu_sampler.h"
 #include "sd_log.h"
+#include "sd_writer.h"
 #include "session.h"
 
 LOG_MODULE_REGISTER(session, LOG_LEVEL_INF);
@@ -44,19 +45,19 @@ static struct k_work  rotate_work;
  * aborts if either writer thread has silently exited (e.g. audio recorder
  * hit dmic_read/fs_write error and left rec_running=0 while the IMU
  * sampler kept going — the bug Cowork caught in #11 testing).
+ *
+ * #23/#25: monitor also owns the .unsynced marker now. The marker is
+ * touched only after sd_writer_audio_bytes_written() > 0 for the current
+ * session, i.e. only once we know real data exists on the card. Crashed-
+ * empty sessions never get a marker, so BLE LIST naturally skips them.
  */
 #define MONITOR_INTERVAL_SEC  1
 static struct k_timer monitor_timer;
 static struct k_work  monitor_work;
+static uint32_t       unsynced_marker_id;   /* 0 = not yet set this session */
+static uint32_t       monitor_ticks;
 
 /* ---------- Helpers ---------- */
-static void chip_id_hex(char *out, size_t n)
-{
-	uint32_t hi = NRF_FICR->DEVICEID[1];
-	uint32_t lo = NRF_FICR->DEVICEID[0];
-	snprintf(out, n, "%08x%08x", (unsigned)hi, (unsigned)lo);
-}
-
 static int statvfs_free_mb(uint32_t *mb_out)
 {
 	struct fs_statvfs s;
@@ -143,24 +144,14 @@ static int save_counter(uint32_t next)
 	return ret < 0 ? ret : 0;
 }
 
-static int write_meta(uint32_t id)
+/* Pure formatter — no FATFS access. Used by both session_start (path A:
+ * write to disk directly) and rotate (path B: hand the body to sd_writer
+ * so the writer thread does the fs_open + fs_write atomically with the
+ * other rotate steps).
+ */
+static int compute_meta_body(uint32_t id, char *out, size_t out_sz)
 {
-	char path[64];
-	snprintf(path, sizeof(path), META_FMT, id);
-
-	struct fs_file_t f;
-	fs_file_t_init(&f);
-	int ret = fs_open(&f, path, FS_O_CREATE | FS_O_WRITE);
-	if (ret) {
-		LOG_ERR("meta open %s: %d", path, ret);
-		return ret;
-	}
-
-	char chip[24];
-	chip_id_hex(chip, sizeof(chip));
-
-	char body[384];
-	int n = snprintf(body, sizeof(body),
+	return snprintf(out, out_sz,
 		"{\n"
 		"  \"session_id\": %u,\n"
 		"  \"start_uptime_ms\": %lld,\n"
@@ -179,8 +170,25 @@ static int write_meta(uint32_t id)
 		FW_VERSION,
 		FW_BUILD_HASH,
 		batt_at_start,
-		chip,
-		chip);
+		identity_get_chip_id(),
+		identity_get_name());
+}
+
+static int write_meta(uint32_t id)
+{
+	char path[64];
+	snprintf(path, sizeof(path), META_FMT, id);
+
+	struct fs_file_t f;
+	fs_file_t_init(&f);
+	int ret = fs_open(&f, path, FS_O_CREATE | FS_O_WRITE);
+	if (ret) {
+		LOG_ERR("meta open %s: %d", path, ret);
+		return ret;
+	}
+
+	char body[384];
+	int n = compute_meta_body(id, body, sizeof(body));
 
 	fs_write(&f, body, n);
 	fs_close(&f);
@@ -203,8 +211,13 @@ static int touch_unsynced(uint32_t id)
 	return 0;
 }
 
-/* Open folder #id: mkdir, write meta, touch .unsynced. Caller owns audio
- * + imu writers. Returns 0 on success.
+/* Open folder #id: mkdir, write meta. Caller owns audio + imu writers.
+ * Returns 0 on success.
+ *
+ * #23: deliberately does NOT touch .unsynced anymore. The marker is set by
+ * the monitor watchdog only after the audio writer reports >0 bytes
+ * actually written, so empty sessions (writer crash before first write)
+ * never appear as sync targets.
  */
 static int prepare_folder(uint32_t id)
 {
@@ -216,8 +229,6 @@ static int prepare_folder(uint32_t id)
 		return ret;
 	}
 	ret = write_meta(id);
-	if (ret) return ret;
-	ret = touch_unsynced(id);
 	if (ret) return ret;
 	return 0;
 }
@@ -237,28 +248,42 @@ static void rotate_work_handler(struct k_work *w)
 		 */
 	}
 
-	uint32_t new_id = next_id++;
-	if (prepare_folder(new_id) < 0) {
-		LOG_ERR("rotate: prepare_folder %u failed — keeping current",
-			new_id);
-		next_id--;
+	/* #27: rotate no longer touches FATFS from the system_work_queue.
+	 * Compute folder + paths + meta body only; hand everything to
+	 * sd_writer which does mkdir + meta write + finalize old + open new
+	 * inside its own thread → no FATFS lock contention with the
+	 * concurrent audio + IMU writes.
+	 */
+	uint32_t new_id = next_id;
+
+	char folder[64], audio_path[64], csv_path[64];
+	snprintf(folder,     sizeof(folder),     FOLDER_FMT, new_id);
+	snprintf(audio_path, sizeof(audio_path), AUDIO_FMT,  new_id);
+	snprintf(csv_path,   sizeof(csv_path),   CSV_FMT,    new_id);
+
+	char meta[384];
+	int meta_n = compute_meta_body(new_id, meta, sizeof(meta));
+	if (meta_n <= 0 || meta_n > (int)sizeof(meta)) {
+		LOG_ERR("rotate: compute_meta_body failed: %d", meta_n);
 		return;
 	}
 
-	char audio_path[64], csv_path[64];
-	snprintf(audio_path, sizeof(audio_path), AUDIO_FMT, new_id);
-	snprintf(csv_path,   sizeof(csv_path),   CSV_FMT,   new_id);
-
-	int ra = audio_recorder_rotate(audio_path);
-	int ri = imu_sampler_rotate(csv_path);
-	if (ra || ri) {
-		LOG_ERR("rotate: writer rotate failed (audio=%d imu=%d)", ra, ri);
+	int rr = sd_writer_rotate_full(folder, audio_path, csv_path,
+				       meta, (uint32_t)meta_n);
+	if (rr) {
+		LOG_ERR("rotate: sd_writer_rotate_full failed: %d", rr);
 		return;
 	}
 
-	save_counter(next_id);
+	next_id = new_id + 1;
+	/* #27: do NOT save_counter() here — would call fs_write on
+	 * /SD/sync_state.json from system_work_queue, racing sd_writer.
+	 * On reboot mid-session, scan_max_session_id() rebuilds the counter
+	 * from on-disk folders. Counter persistence at session_start +
+	 * session_stop is sufficient. */
 	uint32_t old_id = current_id;
 	current_id = new_id;
+	unsynced_marker_id = 0;          /* #23: marker for the new id only */
 	LOG_INF("rotate: SESSION_%05u → SESSION_%05u", old_id, new_id);
 }
 
@@ -274,20 +299,50 @@ static void monitor_work_handler(struct k_work *w)
 	ARG_UNUSED(w);
 	if (!active) return;
 
-	bool audio_alive  = audio_recorder_is_running();
-	bool audio_failed = audio_recorder_failed();
-	bool imu_alive    = imu_sampler_is_running();
+	bool writer_alive   = sd_writer_is_running();
+	bool writer_failed  = sd_writer_failed();
+	bool audio_prod     = audio_producer_is_running();
+	bool imu_prod       = imu_producer_is_running();
 
-	if (audio_alive && imu_alive) {
+	if (writer_alive && audio_prod && imu_prod) {
+		uint32_t a_bytes  = sd_writer_audio_bytes_written();
+		uint32_t i_samp   = sd_writer_imu_samples_written();
+
+		/* #23: set the .unsynced marker exactly once, after the SD
+		 * writer reports its first non-zero byte count for this
+		 * session. Sessions whose writer crashes before any data lands
+		 * never reach this branch and stay marker-less → BLE LIST will
+		 * skip them, no manual cleanup needed.
+		 */
+		if (unsynced_marker_id != current_id && a_bytes > 0) {
+			if (touch_unsynced(current_id) == 0) {
+				unsynced_marker_id = current_id;
+				LOG_INF("monitor: SESSION_%05u .unsynced marker "
+					"set (audio=%u B)", current_id, a_bytes);
+			}
+		}
+
+		/* Heartbeat every 5 s. Includes drop counters so we can see
+		 * back-pressure in real time. */
+		monitor_ticks++;
+		if ((monitor_ticks % 5) == 0) {
+			LOG_INF("monitor: SESSION_%05u tick=%u, "
+				"audio=%u B, imu=%u samples, "
+				"dropped audio=%u imu=%u",
+				current_id, monitor_ticks, a_bytes, i_samp,
+				sd_writer_audio_dropped(),
+				sd_writer_imu_dropped());
+		}
 		return;  /* healthy */
 	}
 
-	LOG_ERR("monitor: writer died — aborting SESSION_%05u "
-		"(audio_alive=%d audio_failed=%d imu_alive=%d, "
+	LOG_ERR("monitor: writer trouble — aborting SESSION_%05u "
+		"(writer_alive=%d failed=%d audio_prod=%d imu_prod=%d, "
 		"audio=%u B, imu=%u samples)",
-		current_id, audio_alive, audio_failed, imu_alive,
-		audio_recorder_bytes_written(),
-		imu_sampler_samples_written());
+		current_id, writer_alive, writer_failed,
+		audio_prod, imu_prod,
+		sd_writer_audio_bytes_written(),
+		sd_writer_imu_samples_written());
 
 	/* Inline the cleanup — we can't call session_stop() because that
 	 * would re-stop our own timers, and we're already running on the
@@ -297,8 +352,7 @@ static void monitor_work_handler(struct k_work *w)
 	active  = false;
 	k_timer_stop(&rotate_timer);
 	k_timer_stop(&monitor_timer);
-	if (audio_alive) audio_recorder_stop();
-	if (imu_alive)   imu_sampler_stop();
+	sd_writer_stop();
 	current_id = 0;
 }
 
@@ -355,20 +409,16 @@ int session_start(int batt_mv)
 	snprintf(audio_path, sizeof(audio_path), AUDIO_FMT, id);
 	snprintf(csv_path,   sizeof(csv_path),   CSV_FMT,   id);
 
-	ret = audio_recorder_start(audio_path);
+	ret = sd_writer_start(audio_path, csv_path);
 	if (ret) {
-		LOG_ERR("audio_recorder_start failed: %d", ret);
-		return ret;
-	}
-	ret = imu_sampler_start(csv_path);
-	if (ret) {
-		LOG_ERR("imu_sampler_start failed: %d", ret);
-		audio_recorder_stop();
+		LOG_ERR("sd_writer_start failed: %d", ret);
 		return ret;
 	}
 
-	current_id = id;
-	next_id    = id + 1;
+	current_id          = id;
+	next_id             = id + 1;
+	unsynced_marker_id  = 0;        /* #23: reset, monitor will set it */
+	monitor_ticks       = 0;
 	save_counter(next_id);
 	aborted = false;
 	active  = true;
@@ -395,10 +445,8 @@ int session_stop(void)
 	k_timer_stop(&rotate_timer);
 	k_timer_stop(&monitor_timer);
 
-	int ra = audio_recorder_stop();
-	int ri = imu_sampler_stop();
-	if (ra && ra != -ENOENT) LOG_WRN("stop: audio_recorder_stop: %d", ra);
-	if (ri && ri != -ENOENT) LOG_WRN("stop: imu_sampler_stop: %d", ri);
+	int rs = sd_writer_stop();
+	if (rs && rs != -ENOENT) LOG_WRN("stop: sd_writer_stop: %d", rs);
 
 	uint32_t closed = current_id;
 	current_id = 0;

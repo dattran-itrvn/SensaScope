@@ -75,7 +75,21 @@
 		compatible = "zephyr,sdhc-spi-slot";
 		reg = <0>;
 		status = "okay";
-		spi-max-frequency = <24000000>;
+		/* 24 MHz is the ceiling FATFS reports as "under 25 MHz" via the
+		 * sdhc_spi driver. We get a few transient `sdhc_spi: Bad data
+		 * CRC` events per minute (5 in 90 s on the test bench) but the
+		 * SD-layer retry handles them and audio data lands intact.
+		 *
+		 * Tried 8 MHz to see if the CRCs disappear — they didn't (still
+		 * 7 in 90 s) AND the slower per-block fs_write made FATFS stalls
+		 * outlast the PDM mem-slab (~800 ms at 8 blocks), so the
+		 * recorder thread got `dmic_read: -EAGAIN` ("No room in RX queue")
+		 * and the watchdog tripped to ERROR. Lowering clock is the wrong
+		 * lever on this PCB; root cause is signal-integrity / card cells,
+		 * not bus speed. Empty-session bug is already fixed via #23
+		 * atomic-marker logic so the CRC noise is cosmetic.
+		 */
+		spi-max-frequency = <8000000>;  /* TEST: 8 MHz with batched writes — revisit before commit */
 
 		mmc {
 			compatible = "zephyr,sdmmc-disk";

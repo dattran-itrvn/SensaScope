@@ -1,140 +1,46 @@
 #include <zephyr/kernel.h>
-#include <zephyr/fs/fs.h>
 #include <zephyr/logging/log.h>
-#include <stdio.h>
-#include <string.h>
+#include <stdint.h>
 
 #include "imu.h"
 #include "imu_sampler.h"
+#include "sd_writer.h"
 
 LOG_MODULE_REGISTER(imu_sampler, LOG_LEVEL_INF);
 
-#define SAMPLER_STACK_SZ  3072
-#define SAMPLER_PRIO      K_PRIO_PREEMPT(6)
+#define PRODUCER_STACK_SZ  2048
+#define PRODUCER_PRIO      K_PRIO_PREEMPT(6)
 
-#define BATCH_SAMPLES     IMU_SAMPLER_RATE_HZ           /* 52 ≈ 1 s */
-#define BUF_SAMPLES       (BATCH_SAMPLES + 16)          /* margin */
-#define LINE_MAX          80
-#define FLUSH_BUF_SIZE    (BATCH_SAMPLES * LINE_MAX)    /* 4160 B */
+static K_THREAD_STACK_DEFINE(prod_stack, PRODUCER_STACK_SZ);
+static struct k_thread     prod_thread;
 
-struct imu_sample {
-	uint64_t t_us;
-	int16_t  ax, ay, az;
-	int16_t  gx, gy, gz;
-};
+static atomic_t            prod_running   = ATOMIC_INIT(0);
+static atomic_t            prod_stop_req  = ATOMIC_INIT(0);
+static volatile uint32_t   pushed;
+static volatile uint32_t   read_errors;
 
-static K_THREAD_STACK_DEFINE(samp_stack, SAMPLER_STACK_SZ);
-static struct k_thread samp_thread;
-
-static struct fs_file_t  csv_file;
-static atomic_t          samp_running    = ATOMIC_INIT(0);
-static atomic_t          samp_stop_req   = ATOMIC_INIT(0);
-static atomic_t          samp_rotate_req = ATOMIC_INIT(0);
-static volatile uint32_t samp_count;
-static uint32_t          samp_dropped;
-
-static struct imu_sample buf[BUF_SAMPLES];
-static int               buf_n;
-static char              flush_text[FLUSH_BUF_SIZE];
-static char              path_buf[64];
-static char              next_path_buf[64];
-static struct k_mutex    path_mtx;
-
-static const char        csv_header[] = "t_us,ax,ay,az,gx,gy,gz\n";
-
-static int swap_file_locked(const char *new_path)
-{
-	fs_close(&csv_file);
-
-	fs_file_t_init(&csv_file);
-	int ret = fs_open(&csv_file, new_path, FS_O_CREATE | FS_O_WRITE);
-	if (ret) {
-		LOG_ERR("sampler: rotate open %s: %d", new_path, ret);
-		return ret;
-	}
-	fs_write(&csv_file, csv_header, sizeof(csv_header) - 1);
-
-	strncpy(path_buf, new_path, sizeof(path_buf) - 1);
-	path_buf[sizeof(path_buf) - 1] = '\0';
-	LOG_INF("sampler: rotated → %s", new_path);
-	return 0;
-}
-
-static int flush_to_file(void)
-{
-	if (buf_n == 0) return 0;
-
-	int total = 0;
-	for (int i = 0; i < buf_n; i++) {
-		int n = snprintf(flush_text + total, FLUSH_BUF_SIZE - total,
-				 "%llu,%d,%d,%d,%d,%d,%d\n",
-				 (unsigned long long)buf[i].t_us,
-				 buf[i].ax, buf[i].ay, buf[i].az,
-				 buf[i].gx, buf[i].gy, buf[i].gz);
-		if (n < 0 || total + n >= FLUSH_BUF_SIZE) {
-			LOG_WRN("flush buf full at i=%d", i);
-			break;
-		}
-		total += n;
-	}
-
-	int ret = fs_write(&csv_file, flush_text, total);
-	buf_n = 0;
-	return ret;
-}
-
-static void sampler_thread_fn(void *p1, void *p2, void *p3)
+static void producer_thread_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
 	const int64_t period_us = 1000000 / IMU_SAMPLER_RATE_HZ;  /* 19230 */
 	int64_t next_us = k_ticks_to_us_floor64(k_uptime_ticks());
 
-	LOG_INF("sampler: streaming @ %d Hz → %s",
-		IMU_SAMPLER_RATE_HZ, path_buf);
+	LOG_INF("imu producer: streaming @ %d Hz", IMU_SAMPLER_RATE_HZ);
 
-	while (!atomic_get(&samp_stop_req)) {
-		/* Honor a pending rotation: flush remaining samples, close old
-		 * file, open new file, write header. The sampler period is
-		 * 19 ms — adding ~50–150 ms of FATFS swap latency may delay
-		 * one or two samples but they aren't dropped (they sit in the
-		 * RAM buffer until the new file is open).
-		 */
-		if (atomic_get(&samp_rotate_req)) {
-			flush_to_file();
-			char path[64];
-			k_mutex_lock(&path_mtx, K_FOREVER);
-			strncpy(path, next_path_buf, sizeof(path) - 1);
-			path[sizeof(path) - 1] = '\0';
-			k_mutex_unlock(&path_mtx);
-
-			if (swap_file_locked(path) < 0) {
-				LOG_ERR("sampler: swap failed → stopping");
-				atomic_clear(&samp_rotate_req);
-				break;
-			}
-			atomic_clear(&samp_rotate_req);
-		}
-
+	while (!atomic_get(&prod_stop_req)) {
 		int16_t a[3], g[3];
 		int ret = imu_read_xlg(a, g);
 		if (ret == 0) {
-			if (buf_n < BUF_SAMPLES) {
-				struct imu_sample *s = &buf[buf_n++];
-				s->t_us = k_ticks_to_us_floor64(k_uptime_ticks());
-				s->ax = a[0]; s->ay = a[1]; s->az = a[2];
-				s->gx = g[0]; s->gy = g[1]; s->gz = g[2];
-				samp_count++;
-			} else {
-				samp_dropped++;
-			}
-		}
-
-		if (buf_n >= BATCH_SAMPLES) {
-			int w = flush_to_file();
-			if (w < 0) {
-				LOG_ERR("imu csv fs_write: %d", w);
-			}
+			struct sd_writer_imu_sample s = {
+				.t_us = k_ticks_to_us_floor64(k_uptime_ticks()),
+				.ax = a[0], .ay = a[1], .az = a[2],
+				.gx = g[0], .gy = g[1], .gz = g[2],
+			};
+			sd_writer_push_imu(&s);   /* drop-newest if full */
+			pushed++;
+		} else {
+			read_errors++;
 		}
 
 		next_us += period_us;
@@ -143,81 +49,38 @@ static void sampler_thread_fn(void *p1, void *p2, void *p3)
 		if (delay > 0 && delay < 100000) {
 			k_usleep(delay);
 		} else if (delay <= 0) {
-			/* fell behind > 1 period — reset baseline, log occasionally */
 			next_us = now_us;
 		}
 	}
 
-	flush_to_file();
-	fs_close(&csv_file);
-	atomic_clear(&samp_running);
-	LOG_INF("sampler: stop, %u samples, %u dropped",
-		samp_count, samp_dropped);
+	LOG_INF("imu producer: stopped, pushed=%u read_errors=%u",
+		pushed, read_errors);
+	atomic_clear(&prod_running);
 }
 
-int imu_sampler_start(const char *csv_path)
+int imu_producer_start(void)
 {
-	if (atomic_get(&samp_running)) {
-		return -EALREADY;
-	}
+	if (atomic_get(&prod_running)) return -EALREADY;
+	pushed       = 0;
+	read_errors  = 0;
+	atomic_clear(&prod_stop_req);
+	atomic_set(&prod_running, 1);
 
-	k_mutex_init(&path_mtx);
-
-	strncpy(path_buf, csv_path, sizeof(path_buf) - 1);
-	path_buf[sizeof(path_buf) - 1] = '\0';
-
-	fs_file_t_init(&csv_file);
-	int ret = fs_open(&csv_file, path_buf, FS_O_CREATE | FS_O_WRITE);
-	if (ret) {
-		LOG_ERR("sampler: open %s: %d", path_buf, ret);
-		return ret;
-	}
-
-	fs_write(&csv_file, csv_header, sizeof(csv_header) - 1);
-
-	samp_count   = 0;
-	samp_dropped = 0;
-	buf_n        = 0;
-	atomic_clear(&samp_stop_req);
-	atomic_clear(&samp_rotate_req);
-	atomic_set(&samp_running, 1);
-
-	k_tid_t tid = k_thread_create(&samp_thread, samp_stack,
-				      K_THREAD_STACK_SIZEOF(samp_stack),
-				      sampler_thread_fn, NULL, NULL, NULL,
-				      SAMPLER_PRIO, 0, K_NO_WAIT);
-	k_thread_name_set(tid, "imu_samp");
+	k_tid_t tid = k_thread_create(&prod_thread, prod_stack,
+				      K_THREAD_STACK_SIZEOF(prod_stack),
+				      producer_thread_fn, NULL, NULL, NULL,
+				      PRODUCER_PRIO, 0, K_NO_WAIT);
+	k_thread_name_set(tid, "imu_prod");
 	return 0;
 }
 
-int imu_sampler_stop(void)
+int imu_producer_stop(void)
 {
-	if (!atomic_get(&samp_running)) {
-		return -ENOENT;
-	}
-	atomic_set(&samp_stop_req, 1);
+	if (!atomic_get(&prod_running)) return -ENOENT;
+	atomic_set(&prod_stop_req, 1);
 	return 0;
 }
 
-int imu_sampler_rotate(const char *new_csv_path)
-{
-	if (!atomic_get(&samp_running)) {
-		return -ENOENT;
-	}
-	k_mutex_lock(&path_mtx, K_FOREVER);
-	strncpy(next_path_buf, new_csv_path, sizeof(next_path_buf) - 1);
-	next_path_buf[sizeof(next_path_buf) - 1] = '\0';
-	k_mutex_unlock(&path_mtx);
-	atomic_set(&samp_rotate_req, 1);
-	return 0;
-}
-
-bool imu_sampler_is_running(void)
-{
-	return atomic_get(&samp_running) != 0;
-}
-
-uint32_t imu_sampler_samples_written(void)
-{
-	return samp_count;
-}
+bool     imu_producer_is_running(void) { return atomic_get(&prod_running) != 0; }
+uint32_t imu_producer_pushed(void)     { return pushed; }
+uint32_t imu_producer_read_errors(void){ return read_errors; }

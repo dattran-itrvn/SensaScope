@@ -1,0 +1,64 @@
+/*
+ * Stress-test overlay for sensapulse_v1/nrf52840.
+ *
+ * Mirrors the production overlay's peripheral set (SPI3+SDHC, I²C+LSM6DSL,
+ * PDM stereo) so phases 5/6 can run the production data path verbatim.
+ * ADC is omitted — battery monitoring isn't part of the data-path test.
+ *
+ * SPI clock is configurable via SD_STRESS_SPI_HZ at build time so the
+ * harness can sweep 24 / 16 / 8 / 4 MHz from a single source.
+ */
+
+#ifndef SD_STRESS_SPI_HZ
+#define SD_STRESS_SPI_HZ 8000000
+#endif
+
+/* I²C0 + LSM6DSL — phase 6 */
+&i2c0 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+
+	lsm6dsl: lsm6dsl@6a {
+		compatible = "st,lsm6dsl";
+		reg = <0x6a>;
+		/* INT1 wiring kept so imu.c's static binding compiles, but the
+		 * stress firmware never calls imu_enable_double_tap(), so no
+		 * tap interrupt is configured at runtime.
+		 */
+		irq-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/* PDM stereo — phase 5 */
+&pdm0 {
+	status = "okay";
+	pinctrl-0 = <&pdm0_default>;
+	pinctrl-names = "default";
+	clock-source = "PCLK32M_HFXO";
+};
+
+/* SPI3 + SDHC — all phases */
+&spi3 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+	pinctrl-0 = <&spi3_default>;
+	pinctrl-1 = <&spi3_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
+
+	sdhc0: sdhc@0 {
+		compatible = "zephyr,sdhc-spi-slot";
+		reg = <0>;
+		status = "okay";
+		spi-max-frequency = <SD_STRESS_SPI_HZ>;
+
+		mmc {
+			compatible = "zephyr,sdmmc-disk";
+			status = "okay";
+		};
+	};
+};

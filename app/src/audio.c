@@ -3,7 +3,9 @@
 #include <zephyr/fs/fs.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
+
 #include "audio.h"
+#include "sd_writer.h"
 
 LOG_MODULE_REGISTER(audio, LOG_LEVEL_INF);
 
@@ -11,11 +13,11 @@ LOG_MODULE_REGISTER(audio, LOG_LEVEL_INF);
 #define PDM_BLOCK_MS      100
 #define PDM_BLOCK_SAMPLES (AUDIO_PDM_RATE_HZ * PDM_BLOCK_MS / 1000)
 #define PDM_BLOCK_BYTES   (PDM_BLOCK_SAMPLES * AUDIO_PDM_CHANNELS * sizeof(int16_t))
-/* 8 blocks × 100 ms = ~800 ms slack before a missed block. Bumped from 4
- * after observing a 343 ms gap in IMU CSV that pointed at SD card write
- * latency spikes — 4 blocks (~400 ms) was on the edge.
+/* 16 blocks × 100 ms = ~1.6 s slack (#25). The slab pointer is the
+ * audio FIFO entry handed to sd_writer; depth here directly sets the
+ * audio queue depth visible to the consumer.
  */
-#define PDM_BLOCK_COUNT   8
+#define PDM_BLOCK_COUNT   16
 
 K_MEM_SLAB_DEFINE_STATIC(pdm_slab, PDM_BLOCK_BYTES, PDM_BLOCK_COUNT, 4);
 
@@ -58,8 +60,8 @@ int audio_init(void)
 	return 0;
 }
 
-/* ---------- WAV header (canonical 44-byte PCM) ---------- */
-static int write_wav_header(struct fs_file_t *f, uint32_t data_bytes)
+/* ---------- One-shot capture (boot smoke test) ---------- */
+static int write_wav_header_local(struct fs_file_t *f, uint32_t data_bytes)
 {
 	uint8_t hdr[44];
 	uint32_t sr  = AUDIO_PDM_RATE_HZ;
@@ -89,7 +91,6 @@ static int write_wav_header(struct fs_file_t *f, uint32_t data_bytes)
 	return fs_write(f, hdr, sizeof(hdr));
 }
 
-/* ---------- One-shot capture (kept for smoke test) ---------- */
 int audio_record_to_wav(const char *path, int seconds,
 			int32_t *peak_l, int32_t *peak_r,
 			int32_t *mean_l, int32_t *mean_r)
@@ -156,7 +157,7 @@ int audio_record_to_wav(const char *path, int seconds,
 	}
 
 	dmic_trigger(dmic_dev, DMIC_TRIGGER_STOP);
-	write_wav_header(&f, total_bytes);
+	write_wav_header_local(&f, total_bytes);
 	fs_close(&f);
 
 	if (peak_l) *peak_l = pl;
@@ -168,200 +169,88 @@ int audio_record_to_wav(const char *path, int seconds,
 	return 0;
 }
 
-/* ---------- Streaming recorder ---------- */
-#define RECORDER_STACK_SZ  4096
-#define RECORDER_PRIO      K_PRIO_PREEMPT(5)
+/* ---------- Streaming producer (#25) ---------- */
+#define PRODUCER_STACK_SZ  3072
+#define PRODUCER_PRIO      K_PRIO_PREEMPT(5)
 
-static K_THREAD_STACK_DEFINE(rec_stack, RECORDER_STACK_SZ);
-static struct k_thread rec_thread;
-static k_tid_t         rec_tid;
+static K_THREAD_STACK_DEFINE(prod_stack, PRODUCER_STACK_SZ);
+static struct k_thread prod_thread;
+static atomic_t        prod_running = ATOMIC_INIT(0);
+static atomic_t        prod_stop_req = ATOMIC_INIT(0);
 
-static struct fs_file_t rec_file;
-static atomic_t         rec_running    = ATOMIC_INIT(0);
-static atomic_t         rec_stop_req   = ATOMIC_INIT(0);
-static atomic_t         rec_rotate_req = ATOMIC_INIT(0);
-/* Set by the writer thread when it exits because of an error rather than
- * a stop request. Lets a watchdog (session manager / main FSM) tell a
- * crashed writer apart from a clean stop.
- */
-static atomic_t         rec_failed     = ATOMIC_INIT(0);
-static volatile uint32_t rec_bytes;
-static char             rec_path_buf[64];
-static char             rec_next_path[64];
-static struct k_mutex   rec_path_mtx;
-
-/* Finalize current WAV (write header with size) and reopen at new_path
- * with a placeholder header. Called from inside the recorder thread only.
- */
-static int swap_file_locked(const char *new_path)
-{
-	write_wav_header(&rec_file, rec_bytes);
-	fs_close(&rec_file);
-	LOG_INF("recorder: rotated, %u B closed → reopen %s",
-		rec_bytes, new_path);
-
-	fs_file_t_init(&rec_file);
-	int ret = fs_open(&rec_file, new_path, FS_O_CREATE | FS_O_WRITE);
-	if (ret) {
-		LOG_ERR("recorder: rotate open %s: %d", new_path, ret);
-		return ret;
-	}
-	uint8_t pad[44] = {0};
-	fs_write(&rec_file, pad, sizeof(pad));
-	rec_bytes = 0;
-
-	strncpy(rec_path_buf, new_path, sizeof(rec_path_buf) - 1);
-	rec_path_buf[sizeof(rec_path_buf) - 1] = '\0';
-	return 0;
-}
-
-static void recorder_thread_fn(void *p1, void *p2, void *p3)
+static void producer_thread_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 	int ret;
 
 	ret = configure_dmic();
 	if (ret < 0) {
-		LOG_ERR("recorder: dmic_configure failed: %d", ret);
-		atomic_set(&rec_failed, 1);
-		goto out_close;
+		LOG_ERR("audio producer: dmic_configure: %d", ret);
+		atomic_clear(&prod_running);
+		return;
 	}
-
 	ret = dmic_trigger(dmic_dev, DMIC_TRIGGER_START);
 	if (ret < 0) {
-		LOG_ERR("recorder: trigger START failed: %d", ret);
-		atomic_set(&rec_failed, 1);
-		goto out_close;
+		LOG_ERR("audio producer: dmic_trigger START: %d", ret);
+		atomic_clear(&prod_running);
+		return;
 	}
-	LOG_INF("recorder: streaming → %s", rec_path_buf);
 
-	uint64_t t0 = k_uptime_get();
+	LOG_INF("audio producer: streaming PDM stereo @ %d Hz",
+		AUDIO_PDM_RATE_HZ);
+
 	uint32_t blocks = 0;
-
-	while (!atomic_get(&rec_stop_req)) {
-		/* Honor a pending rotation request before reading the next block,
-		 * so the just-arriving block lands in the new file. The mem-slab
-		 * holds up to ~800 ms of audio, well above FATFS swap latency.
-		 */
-		if (atomic_get(&rec_rotate_req)) {
-			char path[64];
-			k_mutex_lock(&rec_path_mtx, K_FOREVER);
-			strncpy(path, rec_next_path, sizeof(path) - 1);
-			path[sizeof(path) - 1] = '\0';
-			k_mutex_unlock(&rec_path_mtx);
-
-			if (swap_file_locked(path) < 0) {
-				LOG_ERR("recorder: swap failed → stopping");
-				atomic_set(&rec_failed, 1);
-				atomic_clear(&rec_rotate_req);
-				break;
-			}
-			atomic_clear(&rec_rotate_req);
-		}
-
+	while (!atomic_get(&prod_stop_req)) {
 		void *buf;
 		uint32_t size;
-
 		ret = dmic_read(dmic_dev, 0, &buf, &size, 500);
 		if (ret < 0) {
-			LOG_ERR("recorder: dmic_read failed at %u B / %u blocks: %d",
-				rec_bytes, blocks, ret);
-			atomic_set(&rec_failed, 1);
+			LOG_ERR("audio producer: dmic_read failed at "
+				"%u blocks: %d", blocks, ret);
 			break;
 		}
-		ret = fs_write(&rec_file, buf, size);
-		if (ret < 0) {
-			LOG_ERR("recorder: fs_write failed at %u B / %u blocks: %d",
-				rec_bytes, blocks, ret);
-			atomic_set(&rec_failed, 1);
+
+		/* Push slab pointer into sd_writer's queue. If full → drop:
+		 * caller must free the slab itself.
+		 */
+		if (sd_writer_push_audio(buf) < 0) {
 			k_mem_slab_free(&pdm_slab, buf);
-			break;
 		}
-		rec_bytes += size;
 		blocks++;
-		k_mem_slab_free(&pdm_slab, buf);
 	}
 
 	dmic_trigger(dmic_dev, DMIC_TRIGGER_STOP);
-
-	uint64_t dt_ms = k_uptime_get() - t0;
-	LOG_INF("recorder: stop, %u B written in %llu ms (~%u kB/s)",
-		rec_bytes, dt_ms,
-		dt_ms ? (uint32_t)((uint64_t)rec_bytes * 1000 / dt_ms / 1024) : 0);
-
-out_close:
-	write_wav_header(&rec_file, rec_bytes);
-	fs_close(&rec_file);
-	atomic_clear(&rec_running);
+	LOG_INF("audio producer: stopped after %u blocks", blocks);
+	atomic_clear(&prod_running);
 }
 
-int audio_recorder_start(const char *path)
+int audio_producer_start(void)
 {
-	if (atomic_get(&rec_running)) {
-		return -EALREADY;
-	}
+	if (atomic_get(&prod_running)) return -EALREADY;
+	atomic_clear(&prod_stop_req);
+	atomic_set(&prod_running, 1);
 
-	k_mutex_init(&rec_path_mtx);
-
-	strncpy(rec_path_buf, path, sizeof(rec_path_buf) - 1);
-	rec_path_buf[sizeof(rec_path_buf) - 1] = '\0';
-
-	fs_file_t_init(&rec_file);
-	int ret = fs_open(&rec_file, rec_path_buf, FS_O_CREATE | FS_O_WRITE);
-	if (ret) {
-		LOG_ERR("recorder: open %s: %d", rec_path_buf, ret);
-		return ret;
-	}
-	uint8_t pad[44] = {0};
-	fs_write(&rec_file, pad, sizeof(pad));
-
-	rec_bytes = 0;
-	atomic_clear(&rec_stop_req);
-	atomic_clear(&rec_rotate_req);
-	atomic_clear(&rec_failed);
-	atomic_set(&rec_running, 1);
-
-	rec_tid = k_thread_create(&rec_thread, rec_stack,
-				  K_THREAD_STACK_SIZEOF(rec_stack),
-				  recorder_thread_fn, NULL, NULL, NULL,
-				  RECORDER_PRIO, 0, K_NO_WAIT);
-	k_thread_name_set(rec_tid, "audio_rec");
+	k_tid_t tid = k_thread_create(&prod_thread, prod_stack,
+				      K_THREAD_STACK_SIZEOF(prod_stack),
+				      producer_thread_fn, NULL, NULL, NULL,
+				      PRODUCER_PRIO, 0, K_NO_WAIT);
+	k_thread_name_set(tid, "audio_prod");
 	return 0;
 }
 
-int audio_recorder_stop(void)
+int audio_producer_stop(void)
 {
-	if (!atomic_get(&rec_running)) {
-		return -ENOENT;
-	}
-	atomic_set(&rec_stop_req, 1);
+	if (!atomic_get(&prod_running)) return -ENOENT;
+	atomic_set(&prod_stop_req, 1);
 	return 0;
 }
 
-int audio_recorder_rotate(const char *new_path)
+bool audio_producer_is_running(void)
 {
-	if (!atomic_get(&rec_running)) {
-		return -ENOENT;
-	}
-	k_mutex_lock(&rec_path_mtx, K_FOREVER);
-	strncpy(rec_next_path, new_path, sizeof(rec_next_path) - 1);
-	rec_next_path[sizeof(rec_next_path) - 1] = '\0';
-	k_mutex_unlock(&rec_path_mtx);
-	atomic_set(&rec_rotate_req, 1);
-	return 0;
+	return atomic_get(&prod_running) != 0;
 }
 
-bool audio_recorder_is_running(void)
+void audio_producer_release_slab(void *slab_buf)
 {
-	return atomic_get(&rec_running) != 0;
-}
-
-bool audio_recorder_failed(void)
-{
-	return atomic_get(&rec_failed) != 0;
-}
-
-uint32_t audio_recorder_bytes_written(void)
-{
-	return rec_bytes;
+	if (slab_buf) k_mem_slab_free(&pdm_slab, slab_buf);
 }

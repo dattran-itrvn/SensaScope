@@ -51,7 +51,7 @@ Units: hours. 1 working day = 8 h. Use decimals (e.g. 0.5 h, 2.5 h).
 | # | Task | Estimate (h) | Actual (h) | Variance | Notes |
 |---|---|---|---|---|---|
 | 17 | Session marker + counter + eviction | 3 | — | — | Overlaps with #12. Some work moves between them depending on order. |
-| 18 | Device name + chip-ID fallback | 1.5 | — | — | |
+| 18 | Device name + chip-ID fallback | 1.5 | 1.5 | 0 % | Implementation clean (`device_id.c` + `identity_init()` + meta.json hook). Scenario 1 verified via RTT (`device.name absent → fallback chip_<hex>`); scenario 2 verified by writing `device.name=Dat-test` on SD and observing `meta.json.device_name="Dat-test"` in session #7. Cowork SD bind-mount sticky bug cost ~1 turn on Cowork side but Claude Code side wasn't affected — net 0 % variance. |
 | 19 | BLE GATT Sync Service (firmware) | 24 | — | — | **Highest-risk task.** BLE bulk transfer tuning (PHY 2M + MTU + interval + notify backpressure) is empirical. Could be 16 h if first try succeeds, 32 h if throughput tuning fights us. |
 | 20 | State machine SYNC | 1.5 | — | — | |
 | 21 | PC sync CLI (Python + bleak) | 6 | — | — | |

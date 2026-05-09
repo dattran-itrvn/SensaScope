@@ -152,18 +152,30 @@ int imu_enable_double_tap(imu_tap_cb_t cb)
 	ret = reg_write(LSM6DSL_REG_TAP_CFG, 0x8E);
 	if (ret) goto err;
 
-	/* TAP_THS_6D: tap threshold 5 LSB = 5 × 0.0625 g ≈ 0.31 g.
-	 * Lower → more sensitive. 0x09 ≈ 0.56 g (default for AN5040 demo).
+	/* TAP_THS_6D: 5-bit threshold, 1 LSB = FS/32 = 62.5 mg at ±2 g.
+	 *
+	 * Task #22 — raise to "nấc trung" so worn-on-chest motion (walking
+	 * shocks ~0.3–0.5 g, clothing rub ~0.4–0.6 g, body roll on bed) no
+	 * longer trips double-tap. 0x14 (20 LSB) ≈ 1.25 g → still easy with
+	 * a deliberate fingertip tap on the case, rejects accidental jolts.
+	 *
+	 * Earlier value 0x09 (~0.56 g, AN5040 demo) was too hot for 24/7 wear.
 	 */
-	ret = reg_write(LSM6DSL_REG_TAP_THS_6D, 0x09);
+	ret = reg_write(LSM6DSL_REG_TAP_THS_6D, 0x14);
 	if (ret) goto err;
 
-	/* INT_DUR2 = 0x7F:
-	 *   DUR  (bit7..4)=7  → max gap between 2 taps ≈ 538 ms
-	 *   QUIET(bit3..2)=3  → quiet ~57 ms after a tap
-	 *   SHOCK(bit1..0)=3  → max tap duration ~28 ms
+	/* INT_DUR2 = 0x4E:
+	 *   DUR  (bit7..4)=4 → max gap between 2 taps ≈ 307 ms (was 538 ms)
+	 *                      Forces a quick double-tap; two random jolts
+	 *                      ≥ 350 ms apart no longer count.
+	 *   QUIET(bit3..2)=3 → quiet ~57 ms after a tap (unchanged — filters
+	 *                      mechanical ringing on the case after impact)
+	 *   SHOCK(bit1..0)=2 → max tap duration ~19 ms (was 28 ms)
+	 *                      Slow rubs/swipes filtered as non-tap.
+	 *
+	 * Packed: (4 << 4) | (3 << 2) | 2 = 0x4E.
 	 */
-	ret = reg_write(LSM6DSL_REG_INT_DUR2, 0x7F);
+	ret = reg_write(LSM6DSL_REG_INT_DUR2, 0x4E);
 	if (ret) goto err;
 
 	/* WAKE_UP_THS bit7 SINGLE_DOUBLE_TAP=1 → enable single+double-tap

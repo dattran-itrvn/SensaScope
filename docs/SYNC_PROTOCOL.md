@@ -161,6 +161,19 @@ Throughput math at 7.5 ms interval, 244-byte data payload, 6 packets/interval:
 - 244 × 6 / 0.0075 ≈ 195 kB/s theoretical, ~80 kB/s realistic after stack overhead.
 - 38 MB session at 80 kB/s ≈ 8 minutes. Fits user's 10-min target.
 
+**Realistic fallback if 7.5 ms is denied.** macOS and iOS BLE stacks routinely refuse intervals < 11.25 ms; the request returns `bt_conn_le_param_update` accept with a coerced larger value. At 15 ms the throughput falls to ~40 kB/s realistic → 38 MB ≈ 16 minutes. **Acceptable.** The protocol does not depend on hitting 7.5 ms; tune for "best the host gives us, no app retries on slow path".
+
+**Power budget reality check (post-overnight stress test).**
+The hardware draws ~26 mA in `RECORDING` state (LED solid 13 mA + recording 13 mA). A small ~50 mAh wearable cell gives ~110 minutes runtime under recording — already a constraint. During `SYNC` state we replace the recording load with BLE radio + SD reads:
+- LED in SYNC pattern (2 Hz blink, 50 % duty) ≈ 6.5 mA average.
+- BLE 5.0 PHY 2M continuous notify, low-margin connection: ~10 mA average.
+- SD reads (sustained block reads at 8 MHz SPI): ~5 mA.
+- **Total ≈ 22 mA in SYNC.**
+
+Per session sync at 80 kB/s = 8 min × 22 mA = 2.9 mAh. At 40 kB/s (15 ms interval) = 16 min × 22 mA = 5.9 mAh. With a 50 mAh cell and budget for 1 hour record/day (~26 mAh), sync of 6 sessions leaves enough headroom for the next day's recording — assuming user docks for charging between sync sessions. Tighter cells need smaller BLE duty.
+
+If throughput tuning fights us in the firmware (#19), the fallback is **slower sync, not protocol redesign**. Don't sacrifice protocol simplicity to chase the last 20 % of throughput.
+
 ## PC sync flow (Python)
 
 ```python
@@ -193,6 +206,16 @@ Resume after disconnect: PC checks for `*.tmp` folders; for each, ask device for
 - **Device in RECORDING state when host connects** → device replies to LIST/READ/ACK with `0x01 busy`. PC tool prints "device is recording, sync skipped" and disconnects.
 - **SD full + no synced folders** → device's `Device Info` shows `state: "error"` and `sd_free_mb < 100`. PC tool warns the user; sync proceeds normally to clear unsynced data, then user reboots device to clear error state.
 - **PC disconnects mid-READ** → device aborts in-flight transfer on disconnect. Marker `.unsynced` stays — next reconnect resumes via offset.
+
+### Skipping empty / corrupt sessions
+
+Overnight stability data showed ~40 % of sessions can land empty (audio.wav and imu.csv = 0 bytes) and ~17 % can have folder→file FATFS corruption when the chip resets mid-session. The sync protocol must not treat these as transfer failures:
+
+- **LIST** filters out folders whose `audio.wav` is 0 bytes *or* missing — they have no payload worth downloading. The marker `.unsynced` stays, but firmware logs once and ignores. (Optional: a separate cleanup pass can `DEL` them when unambiguous.)
+- **LIST** also skips entries that are not directories at all (the `SESSION_NNNNN` file corruption case). Don't crash, log and move on.
+- **PC tool** treats a zero-byte audio file from a normal session (which can happen if user double-tapped stop too fast — < 100 ms after start) as a sync target with `total_bytes=0` for that file; READ returns 0 bytes immediately, ACK still removes the marker.
+
+These rules keep the protocol forward-compatible with the v1.0 reliability hardening (`docs/PRODUCTION_TODO.md` § Reliability — `fs_sync()` periodic, atomic session create order). When that hardening lands, the empty-session rate should drop toward zero, but the LIST filter stays for forward safety.
 
 ## Spec versioning
 

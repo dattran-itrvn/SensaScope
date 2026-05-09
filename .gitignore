@@ -1,5 +1,7 @@
 # Build artifacts
 app/build/
+app/sd_stress/build/
+**/build/
 *.o
 *.elf
 *.hex

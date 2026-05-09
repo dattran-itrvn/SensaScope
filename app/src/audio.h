@@ -4,6 +4,12 @@
  *  Channel mapping (per schematic + mic L/R config):
  *    ch0 = LEFT  = body mic    (MP23DB01HP, L/R=GND, falling edge)
  *    ch1 = RIGHT = ambient mic (IMP34DT05,  L/R=VDD, rising edge)
+ *
+ *  After #25 refactor: this module is a *producer*. It reads PDM blocks
+ *  from the DMIC API and pushes the slab pointers into sd_writer's
+ *  audio FIFO. It no longer touches FATFS directly. The actual
+ *  audio.wav file is opened, written, finalized, and closed by
+ *  sd_writer (single SD-writing thread).
  */
 #pragma once
 
@@ -16,43 +22,27 @@
 
 int audio_init(void);
 
-/* ---------- One-shot capture (used by smoke test, blocking) ---------- */
+/* ---------- One-shot capture (boot smoke test, blocking) ---------- */
 int audio_record_to_wav(const char *path, int seconds,
 			int32_t *peak_l, int32_t *peak_r,
 			int32_t *mean_l, int32_t *mean_r);
 
-/* ---------- Streaming recorder (async) ----------
+/* ---------- Streaming producer (#25) ----------
  *
- *   audio_recorder_start(path)  → non-blocking; opens WAV file, writes
- *                                 placeholder header, starts PDM, spawns
- *                                 a writer thread. Returns 0 on success.
+ *   audio_producer_start()    → configure DMIC, trigger START, spawn the
+ *                                producer thread. Returns 0 on success.
  *
- *   audio_recorder_stop()       → non-blocking; signals writer thread to
- *                                 finalize. The thread writes the proper
- *                                 WAV header and closes the file.
- *                                 Use audio_recorder_is_running() to wait.
+ *   audio_producer_stop()     → request producer thread exit; the thread
+ *                                sets DMIC STOP and exits its loop. Use
+ *                                audio_producer_is_running() to wait.
  *
- *   The writer thread reads PDM blocks (~100 ms each) and streams to FAT
- *   file. No size cap.  Caller owns rotation policy.
+ *   audio_producer_release_slab(buf) → called by sd_writer after it has
+ *                                consumed a PDM block. Returns the slab
+ *                                buffer to the mem-slab so the DMIC
+ *                                driver can reuse it. Producers don't
+ *                                free; consumer does, after fs_write.
  */
-int      audio_recorder_start(const char *path);
-int      audio_recorder_stop(void);
-bool     audio_recorder_is_running(void);
-uint32_t audio_recorder_bytes_written(void);
-
-/* True if the writer thread exited because of an error (dmic_read,
- * dmic_trigger, fs_write, configure_dmic) rather than a stop request.
- * Cleared on the next audio_recorder_start. Used by the session manager
- * to detect a silently-dead writer.
- */
-bool     audio_recorder_failed(void);
-
-/* Seamless mid-stream rotation: signal the writer thread to finalize the
- * current file and open `new_path`. The DMIC keeps running across the
- * swap; up to ~800 ms of audio is buffered in the PDM mem-slab so the
- * swap is gap-free as long as it completes before the slab fills.
- *
- * Returns -ENOENT if no recorder running, 0 on request accepted (the
- * actual swap happens on the recorder thread's next iteration).
- */
-int      audio_recorder_rotate(const char *new_path);
+int  audio_producer_start(void);
+int  audio_producer_stop(void);
+bool audio_producer_is_running(void);
+void audio_producer_release_slab(void *slab_buf);

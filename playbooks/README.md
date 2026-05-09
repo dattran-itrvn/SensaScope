@@ -8,6 +8,7 @@ Each `*.json` file describes one overnight test scenario. `scripts/run_loop.py` 
 |---|---|---|
 | `short_smoke_x10.json` | ~10 × 30 s | Validate the loop scripts themselves before trusting overnight runs. |
 | `long_recording_stability.json` | 30 min × 1 | Idle-running stability — board boots, runs, doesn't crash. |
+| `v1_overnight_stability.md` | 8 h, manual | Full v1.0 recording engine stability across ~48 sessions × 10 min rotation. **Manual procedure** (requires user double-tap to start) — see the .md file for kick-off + post-mortem instructions. Analyzer: `tools/analyze_overnight.py`. |
 
 ## Schema
 

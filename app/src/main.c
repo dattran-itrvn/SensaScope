@@ -23,10 +23,12 @@
 
 #include "led.h"
 #include "battery.h"
+#include "device_id.h"
 #include "imu.h"
 #include "imu_sampler.h"
 #include "audio.h"
 #include "sd_log.h"
+#include "sd_writer.h"
 #include "session.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -170,6 +172,7 @@ int main(void)
 
 	if (audio_init() == 0 && sdlog_init() == 0) {
 		sdlog_append_boot_stamp();
+		identity_init();
 		int32_t pl, pr, ml, mr;
 		if (audio_record_to_wav(SMOKE_WAV_PATH, SMOKE_RECORD_S,
 					&pl, &pr, &ml, &mr) == 0) {
@@ -213,8 +216,8 @@ int main(void)
 					transition(APP_STATE_ERROR);
 				} else {
 					LOG_INF("Stopped: audio_last=%u B, imu_last=%u samples",
-						audio_recorder_bytes_written(),
-						imu_sampler_samples_written());
+						sd_writer_audio_bytes_written(),
+						sd_writer_imu_samples_written());
 					transition(APP_STATE_IDLE);
 				}
 				break;

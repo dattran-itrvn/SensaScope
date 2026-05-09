@@ -105,11 +105,12 @@ Configure `TAP_CFG`/`TAP_THS_6D`/`INT_DUR2`/`WAKE_UP_THS`/`MD1_CFG` per AN5040 r
 - Free-space eviction logic: scan unsynced/synced folders, delete oldest synced when free < 100 MB.
 - ERROR-state entry path: SD full + no synced folders → set `state = ERROR`, LED SOS, refuse `session_start`.
 
-**#18 ⏳ Device name file + chip-id fallback**
+**#18 ✅ Device name file + chip-id fallback**
 - Read `/SD/device.name` (max 32 bytes UTF-8) on boot. Strip newline.
 - If file absent or empty: format chip ID from `NRF_FICR->DEVICEID[0..1]` (two `uint32_t` → 16 hex chars) into `"chip_<hex>"`.
-- Expose name + chip_id in BLE `Device Info` characteristic.
-- BLE `Set Name` characteristic (write): persists to file, takes effect immediately.
+- Expose name + chip_id in BLE `Device Info` characteristic. (BLE wiring deferred to #19; identity_init result is consumed by meta.json now and by Device Info GATT later.)
+- BLE `Set Name` characteristic (write): persists to file, takes effect immediately. (Deferred to #19 along with the rest of the GATT.)
+- **Verified** end-to-end: scenario 1 (no file → fallback `chip_361e30a6dd726309`) via RTT log; scenario 2 (custom file `Dat-test`) by reading `meta.json` from a real session (`session_id=7`, `device_name="Dat-test"`) — confirms `identity_init()` reads SD and propagates the value into the session metadata.
 
 **#19 ⏳ BLE Sync Service GATT (firmware)**
 - Implement custom service per `docs/SYNC_PROTOCOL.md`. Service UUID `7e7e0001-3c4f-4b8e-8a8a-5e5e5e5e5e5e`.
@@ -129,6 +130,78 @@ Configure `TAP_CFG`/`TAP_THS_6D`/`INT_DUR2`/`WAKE_UP_THS`/`MD1_CFG` per AN5040 r
   - `SYNC → RECORDING` forbidden — drop double-tap events while in SYNC.
 - BLE controller off in `RECORDING` (saves power + frees nRF radio for hypothetical noise audit), on in `IDLE`.
 - ERROR state still allows `SYNC` (so user can drain unsynced data even when SD is full).
+
+**#24 🚧 SD subsystem isolation stress firmware (diagnostic, not a fix)**
+
+Standalone firmware in `app/sd_stress/` that mounts FATFS and runs 4 phases of synthetic write tests with no PDM, no IMU, no FSM, no BLE. Goal: distinguish whether the empty-session / -EIO bug lives in the SD subsystem alone or only when SD interacts with the rest of the production app.
+
+Phases (auto on boot, no human input):
+- Phase 1 `seq_bulk` — 1 MB blocks × 20 = 20 MB at peak rate.
+- Phase 2 `sustained` — 4 KB / 25 ms ≈ 160 KB/s for 60 s.
+- Phase 3 `dual_audio` + `dual_imu` — 4 KB/25 ms + 256 B/200 ms in parallel for 60 s, mimicking the production writer pair.
+- Phase 4 `sustained_synced` — phase 2 with `fs_sync` every 5 s (matches #23).
+
+Final RTT line is a JSON `STRESS_SUMMARY: {...}` consumed by `scripts/parse_sd_stress.py`. `scripts/sd_stress_loop.sh` builds once, then flashes + RTT-captures + parses 10 iterations in a row — fully automatic, ~40 min wall clock.
+
+Decision matrix (handled by `playbooks/sd_stress_isolation.md`):
+- 10/10 pass with 0 errors → bug is interaction-class (PDM ↔ FATFS ↔ watchdog). Revert #23 fs_sync; investigate writer-thread race instead.
+- ≥1 fail or >1 % write errors → bug is in SD subsystem (driver / FATFS / hardware). Different fix path.
+- Latency > 500 ms → SD subsystem stalls long enough to break PDM in production even without errors.
+
+**Why this exists**: 5 iterations of fs_sync / retry / clock-tuning patches on the production firmware moved the failure mode instead of eliminating it. We need an answer to "where" before we try another fix.
+
+**#23 ✅ SD write reliability — empty session bug** (closed by architectural fix #25 — fs_sync band-aid abandoned. Production 25-min 3-rotate test PASS.)
+
+**#24 ✅ SD subsystem isolation stress firmware** (verified SD subsystem clean in isolation; isolated bug to triple-interaction layer; informed #25 redesign.)
+
+**#25 ✅ SD writer refactor — single-thread + 2 FIFO**
+- New module `sd_writer.c/h` (~290 lines): one consumer thread owning FATFS, two producer FIFOs (audio_msgq 16 × ptr ≈ 1.6 s slack via PDM mem-slab; imu_msgq 128 × 20 B ≈ 2.5 s slack).
+- `audio.c` + `imu_sampler.c` simplified to producers (push slab/struct, never touch FATFS). API renamed `audio_recorder_*` → `audio_producer_*`, `imu_sampler_*` → `imu_producer_*`.
+- session.c orchestrates via single `sd_writer_start` / `sd_writer_stop`. Watchdog reads counters via `sd_writer_*_bytes_written` / `*_dropped`.
+- PDM_BLOCK_COUNT bumped 8 → 16 (1.6 s slack). Drop-newest backpressure on FIFO full.
+- **Stress phase 6**: pre-#25 was 2/5 PASS, post-#25 is 2/2 PASS with max latency drop 380 ms → 92 ms.
+- **Production 25-min**: see #27 results. Bundled with #22 (LED + tap tuning).
+
+**#27 ✅ Rotation continuity — folder-prep moved into sd_writer thread**
+- `sd_writer_rotate_full(folder, audio_path, csv_path, meta_body, meta_len)` atomically does drain → finalize old → fs_mkdir → write meta.json → open new pair, all from sd_writer thread.
+- session.c rotate_work_handler now only computes paths + meta string and queues — no FATFS access on system_work_queue.
+- save_counter() removed from rotate path (boot scan_max_session_id() handles recovery).
+- **Verified** production 25-min session: SESSION_00003 (38.4 MB), SESSION_00004 (38.39 MB), SESSION_00005 (15.68 MB ongoing). 2/2 rotates gap-free, 0 audio dropped, 0 IMU dropped, FSM never → ERROR.
+
+**#22 ✅ LED + double-tap tuning** (bundled into the data-path fix branch; production-verified during 25-min session)
+
+**#26 ⏳ SD cold-boot init flakiness — CMD0 fail**
+- ~60 % of fresh boots fail SD init at CMD0/CMD8. Pre-existing, unrelated to data path. Fix candidates: 100 ms VDD settle delay before sdlog_init, 80 idle SCLK pre-CMD0 per SD spec.
+
+**#28 ⏳ Marker-touch race during rotate — cosmetic cleanup**
+- Monitor's `touch_unsynced(new_id)` sometimes fires before sd_writer's `fs_mkdir(folder)` lands — gets `-ENOENT`, self-heals on next 1 Hz tick. Strict effect: 1 `<err>` log line per rotate. Functionally clean.
+- Fix: add `sd_writer_is_rotating()` predicate; monitor skips marker check while rotate pending. ~20 lines.
+
+[OBSOLETE — superseded by #25/#27 above; kept for history]
+
+
+Symptom: ~50 % of sessions land with `audio.wav = 0 B, imu.csv = 0 B, meta.json = 234 B`. Confirmed across both old worn SD card (overnight, sessions 1 + 3) and **new SD card** (today, session 7). Rules out hardware silent corruption — bug is in firmware reliability path.
+
+Three patches landed on this branch:
+
+1. **`audio.c`** — periodic `fs_sync(&rec_file)` every 50 blocks (~5 s), with heartbeat `LOG_INF("recorder: %u blocks, %u B (sync OK)")`. Without sync, FATFS RAM-cached PCM is wiped on writer-thread death or chip reset. Each sync is one SPI burst (~5–20 ms), well under the 800 ms mem-slab slack.
+2. **`imu_sampler.c`** — `fs_sync(&csv_file)` after every flush (~1 Hz), with `LOG_INF("sampler: flushed %d samples (total=%u, sync OK)")`. Same rationale.
+3. **`session.c`** — atomic `.unsynced` marker. The marker is now touched by the monitor watchdog only after `audio_recorder_bytes_written() > 0` for the current session. Empty sessions never get a marker → BLE LIST naturally skips them. Bonus: monitor logs a tick heartbeat every 5 s with current `audio` + `imu` sample counts so RTT pinpoints exactly when a writer dies.
+
+Verify: build, flash, capture 90 s RTT around a tap-start. Two outcomes: (a) heartbeat logs appear and audio.wav is non-empty after stop → sync was the cause, fix works. (b) heartbeat missing or ends abruptly → writer is dying for a different reason; the new error logs will name the failing call.
+
+**#22 🚧 LED + double-tap tuning (in flight)**
+- **LED**: redesign IDLE + RECORDING patterns to "sparse heartbeat" so the LED no longer dominates current draw during 24/7 wear.
+  - IDLE: single 100 ms pulse every 3 s (~3.3 % duty, ~0.43 mA avg).
+  - RECORDING: double 100 ms pulse with 200 ms gap, then 4.7 s dark (~4 % duty, ~0.52 mA avg). Distinguishable from IDLE at a glance — single vs double pulse.
+  - LOW_BATT / ERROR / SYNC unchanged (those states want to be visible/alarming, are short-lived, or only used during BLE sync).
+  - Saving: ~25× lower LED current in RECORDING vs old solid-on (13 mA → 0.5 mA). Doubles record-only runtime on a small wearable cell.
+- **Double-tap**: raise sensitivity threshold so worn-on-chest motion (walking, clothing rub, body roll) doesn't trip false starts.
+  - `TAP_THS_6D` 0x09 → **0x14** (~0.56 g → ~1.25 g, "nấc trung").
+  - `INT_DUR2` 0x7F → **0x4E** (DUR=4 → ~307 ms gap, SHOCK=2 → ~19 ms max impulse, QUIET=3 unchanged).
+  - Effect: requires deliberate fingertip tap on the case; rejects accidental jolts. Confirm by overnight wear test — if tap still misses, drop to 0x10 (~1.0 g).
+- v1.1.1 (planned, not in this task): add BLE Control opcodes `START_RECORD` / `STOP_RECORD` so PC tool can start/stop sessions. Requires BLE controller to stay on during RECORDING — spec change vs current SYNC_PROTOCOL.md, will be addressed when v1.1.1 kicks off.
+- **Status**: code changes landed on this branch; awaiting build + flash + RTT verify on PCB v1.0.
 
 **#21 ⏳ PC sync CLI (Python + bleak)**
 - Fill in `tools/sync.py` stubs: `cmd_list`, `cmd_read`, `cmd_ack`.

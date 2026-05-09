@@ -98,6 +98,18 @@ After each phase closes, update this section with what we learned:
 - **For v1.1**: BLE GATT (#19, est. 24 h) is the only task that introduces new SDK surface area. Apply 1.3× to that one and leave the rest at 1.0×.
 - **Hardware-debug iterations were a separate budget line.** Worn-SD chase cost ~1 h, J-Link RTT chase ~0.75 h. Both are now captured in `Tooling lessons` so future-us pays once.
 
+#### Overnight stability findings (post-merge)
+
+The first overnight run after merging Milestone A surfaced reliability problems the smoke tests didn't:
+
+- **40 % of session folders empty** (2 of 5): `audio.wav = 44 B, data_bytes=0`, `imu.csv` had only the column header. Writer threads almost certainly crashed before the first `fs_sync` reached the card — the FATFS dirent existed but no data block was committed.
+- **17 % corrupted folder** (1 of 6 created): partial / truncated state on s6.
+- **1 unexplained reset** between s3 and s4 (uptime jumped from 260 s → 8 s). Could be hardfault, brownout, watchdog, or external reset — we can't tell because `NRF_POWER->RESETREAS` is never read.
+- **Battery drain ~66 mV in ~11 min of active recording** — fits the linear-discharge model, no anomaly. ~6 mV/min when streaming PDM + SD + LSM6DSL + LED solid.
+- **s5 ran 548 s ≈ 9.14 min**, very close to the 10-min rotation cycle. Confirms rotation cadence is roughly right but we didn't see a clean rotate→rotate→stop sequence in this run.
+
+**Action taken now**: three production-hardening items captured in `docs/PRODUCTION_TODO.md` § Reliability — periodic `fs_sync()`, atomic session-creation order (sync placeholder data *before* writing `.unsynced` marker), and `RESETREAS` logging at boot. None of these block v1.1: BLE sync only touches sessions that have a valid `.unsynced` marker plus committed data, so it can be built and tested while the empty-session failure mode is still on the production checklist. A second overnight run should re-measure the failure rate after the production fixes land.
+
 ### v1.1 (open)
 
 (Fill in when closed.)

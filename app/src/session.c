@@ -222,19 +222,125 @@ static int prepare_folder(uint32_t id)
 	return 0;
 }
 
+/* ---------- Free-space management (#17) ---------- */
+
+static bool session_has_unsynced_marker(uint32_t id)
+{
+	char path[64];
+	snprintf(path, sizeof(path), UNSYNCED_FMT, id);
+	struct fs_dirent ent;
+	return fs_stat(path, &ent) == 0;
+}
+
+/* Scan /SD/ for SESSION_NNNNN folders that are *synced* (marker absent)
+ * and not the currently-active session, return the lowest-numbered id.
+ * Returns 0 if no eviction candidate exists.
+ */
+static uint32_t find_oldest_synced_id(void)
+{
+	struct fs_dir_t dir;
+	fs_dir_t_init(&dir);
+	if (fs_opendir(&dir, SD_MOUNT_POINT)) return 0;
+
+	uint32_t min_id = 0;
+	const size_t prefix_len = sizeof(SESSION_PREFIX) - 1;
+
+	for (;;) {
+		struct fs_dirent ent;
+		int ret = fs_readdir(&dir, &ent);
+		if (ret || ent.name[0] == '\0') break;
+		if (ent.type != FS_DIR_ENTRY_DIR) continue;
+		if (strncmp(ent.name, SESSION_PREFIX, prefix_len) != 0) continue;
+
+		uint32_t id = (uint32_t)strtoul(ent.name + prefix_len, NULL, 10);
+		if (id == 0)              continue;  /* malformed name */
+		if (id == current_id)     continue;  /* never the active session */
+		if (session_has_unsynced_marker(id)) continue;
+
+		if (min_id == 0 || id < min_id) min_id = id;
+	}
+	fs_closedir(&dir);
+	return min_id;
+}
+
+/* Unlink audio.wav, imu.csv, meta.json (any subset that exists), the
+ * .unsynced marker if somehow present, and finally the folder itself.
+ */
+static int delete_session(uint32_t id)
+{
+	char path[64];
+	const char *fmts[] = { AUDIO_FMT, CSV_FMT, META_FMT, UNSYNCED_FMT };
+
+	for (size_t i = 0; i < ARRAY_SIZE(fmts); i++) {
+		snprintf(path, sizeof(path), fmts[i], id);
+		int ret = fs_unlink(path);
+		if (ret && ret != -ENOENT) {
+			LOG_WRN("evict: unlink %s: %d", path, ret);
+		}
+	}
+
+	snprintf(path, sizeof(path), FOLDER_FMT, id);
+	int ret = fs_unlink(path);  /* fs_unlink removes empty directories */
+	if (ret) {
+		LOG_ERR("evict: rmdir %s: %d", path, ret);
+		return ret;
+	}
+	LOG_INF("evicted SESSION_%05u", id);
+	return 0;
+}
+
+/* Make sure free space ≥ MIN_FREE_MB before opening a new folder.
+ * Evicts oldest synced sessions until the budget is met, or returns
+ * -ENOSPC when no synced folder remains to evict (caller should
+ * transition to ERROR — see main FSM and rotate_work_handler).
+ */
+static int ensure_free_space(void)
+{
+	uint32_t free_mb = 0;
+	int evicted = 0;
+
+	while (statvfs_free_mb(&free_mb) == 0 && free_mb < MIN_FREE_MB) {
+		uint32_t victim = find_oldest_synced_id();
+		if (victim == 0) {
+			LOG_ERR("free=%u MB < %u, no synced folder to evict "
+				"(after %d evict(s))",
+				free_mb, MIN_FREE_MB, evicted);
+			return -ENOSPC;
+		}
+		LOG_WRN("free=%u MB < %u → evicting SESSION_%05u",
+			free_mb, MIN_FREE_MB, victim);
+		int ret = delete_session(victim);
+		if (ret) return ret;
+		evicted++;
+	}
+	if (evicted) {
+		LOG_INF("eviction freed space, %u MB now available "
+			"after %d delete(s)", free_mb, evicted);
+	}
+	return 0;
+}
+
 /* ---------- Rotation ---------- */
 static void rotate_work_handler(struct k_work *w)
 {
 	ARG_UNUSED(w);
 	if (!active) return;
 
-	uint32_t free_mb = 0;
-	if (statvfs_free_mb(&free_mb) == 0 && free_mb < MIN_FREE_MB) {
-		LOG_WRN("rotate: only %u MB free — eviction is task #17, "
-			"continuing into next folder anyway", free_mb);
-		/* TODO #17: evict oldest synced folder; if none, stop session
-		 * and have main FSM transition to ERROR.
+	if (ensure_free_space() == -ENOSPC) {
+		LOG_ERR("rotate: SD full + no synced folder — aborting session");
+		/* Same shape as the watchdog abort path: set aborted+!active
+		 * so the main FSM observes the change next tick and transitions
+		 * to STATE_ERROR. We can't call session_stop() because we'd
+		 * re-stop our own timers from inside the system work queue.
 		 */
+		aborted = true;
+		active  = false;
+		k_timer_stop(&rotate_timer);
+		k_timer_stop(&monitor_timer);
+		audio_recorder_stop();
+		imu_sampler_stop();
+		current_id = 0;
+		return;
 	}
 
 	uint32_t new_id = next_id++;
@@ -339,16 +445,13 @@ int session_start(int batt_mv)
 {
 	if (active) return -EALREADY;
 
-	uint32_t free_mb = 0;
-	if (statvfs_free_mb(&free_mb) == 0 && free_mb < MIN_FREE_MB) {
-		LOG_ERR("session_start: only %u MB free, refusing (need eviction "
-			"or sync)", free_mb);
-		return SESSION_ERR_NO_SPACE;
-	}
+	int ret = ensure_free_space();
+	if (ret == -ENOSPC) return SESSION_ERR_NO_SPACE;
+	if (ret)            return ret;
 
 	batt_at_start = batt_mv;
 	uint32_t id = next_id;
-	int ret = prepare_folder(id);
+	ret = prepare_folder(id);
 	if (ret) return ret;
 
 	char audio_path[64], csv_path[64];

@@ -79,6 +79,13 @@ bool sd_writer_is_running(void);
  */
 bool sd_writer_failed(void);
 
+/* True from the moment sd_writer_rotate_full() is called until the
+ * consumer thread has finished mkdir + meta + open new pair. Used by
+ * session.c monitor (#28) to suppress touch_unsynced(new_id) until the
+ * folder actually exists on disk.
+ */
+bool sd_writer_is_rotating(void);
+
 /* ---------- Producer push (used by audio.c + imu_sampler.c) ---------- */
 
 /* Push one PDM slab pointer into the audio FIFO. The slab is freed by

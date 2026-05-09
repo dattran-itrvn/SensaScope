@@ -34,9 +34,37 @@ int sdlog_print_info(void)
 	return 0;
 }
 
+/* #26: cold-boot init was failing CMD0/CMD8 in ~60 % of fresh boots on
+ * this PCB, especially right after a J-Link flash (Vcc transient + card
+ * reset timing). Two mitigations stacked here:
+ *
+ *  (a) 100 ms power/clock settle before the first disk_access_init().
+ *      The SD spec requires ≥ 1 ms after Vcc rise + ≥ 74 SCLK idle
+ *      cycles before CMD0; the sdhc_spi driver does the SCLK part but
+ *      not always with enough margin against in-rush noise. 100 ms is
+ *      far above the 1 ms minimum and adds negligible boot delay.
+ *
+ *  (b) Up to 3 retries with 200 ms gap if the first init fails. Lets
+ *      the card's internal supervisor finish self-init even if it was
+ *      mid-startup when we issued CMD0.
+ */
 int sdlog_init(void)
 {
-	int ret = sdlog_print_info();
+	k_msleep(100);  /* (a) settle */
+
+	int ret = -EIO;
+	for (int attempt = 1; attempt <= 3; attempt++) {
+		ret = sdlog_print_info();
+		if (ret == 0) {
+			if (attempt > 1) {
+				LOG_INF("SD init OK on attempt %d", attempt);
+			}
+			break;
+		}
+		LOG_WRN("SD init attempt %d failed: %d — retrying in 200 ms",
+			attempt, ret);
+		k_msleep(200);  /* (b) gap */
+	}
 	if (ret) return ret;
 
 	ret = fs_mount(&sd_mp);

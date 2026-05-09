@@ -313,8 +313,13 @@ static void monitor_work_handler(struct k_work *w)
 		 * session. Sessions whose writer crashes before any data lands
 		 * never reach this branch and stay marker-less → BLE LIST will
 		 * skip them, no manual cleanup needed.
+		 *
+		 * #28: skip while a rotate is pending — the new folder's mkdir
+		 * may not have landed yet and touch_unsynced would log a
+		 * spurious -ENOENT before retrying on the next 1 Hz tick.
 		 */
-		if (unsynced_marker_id != current_id && a_bytes > 0) {
+		if (unsynced_marker_id != current_id && a_bytes > 0
+		    && !sd_writer_is_rotating()) {
 			if (touch_unsynced(current_id) == 0) {
 				unsynced_marker_id = current_id;
 				LOG_INF("monitor: SESSION_%05u .unsynced marker "

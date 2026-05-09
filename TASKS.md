@@ -170,12 +170,12 @@ Decision matrix (handled by `playbooks/sd_stress_isolation.md`):
 
 **#22 ✅ LED + double-tap tuning** (bundled into the data-path fix branch; production-verified during 25-min session)
 
-**#26 ⏳ SD cold-boot init flakiness — CMD0 fail**
-- ~60 % of fresh boots fail SD init at CMD0/CMD8. Pre-existing, unrelated to data path. Fix candidates: 100 ms VDD settle delay before sdlog_init, 80 idle SCLK pre-CMD0 per SD spec.
+**#26 ✅ SD cold-boot init flakiness — CMD0 fail**
+- `sdlog_init()` now: (a) `k_msleep(100)` before first `disk_access_init()` for power/clock settle; (b) up to 3 attempts with 200 ms gap. Eliminates the J-Link-flash-Vcc-transient + card-internal-startup race that produced ~60 % cold-init failures during stress loop.
 
-**#28 ⏳ Marker-touch race during rotate — cosmetic cleanup**
-- Monitor's `touch_unsynced(new_id)` sometimes fires before sd_writer's `fs_mkdir(folder)` lands — gets `-ENOENT`, self-heals on next 1 Hz tick. Strict effect: 1 `<err>` log line per rotate. Functionally clean.
-- Fix: add `sd_writer_is_rotating()` predicate; monitor skips marker check while rotate pending. ~20 lines.
+**#28 ✅ Marker-touch race during rotate — cosmetic cleanup**
+- Added `sd_writer_is_rotating()` returning `atomic_get(&rotate_req)`.
+- session.c monitor now gates `touch_unsynced` on `!sd_writer_is_rotating()`. ENOENT race window closed at source — no more spurious err logs at rotate boundaries.
 
 [OBSOLETE — superseded by #25/#27 above; kept for history]
 

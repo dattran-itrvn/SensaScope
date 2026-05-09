@@ -411,8 +411,9 @@ int sd_writer_rotate_full(const char *new_folder,
 	return 0;
 }
 
-bool sd_writer_is_running(void)  { return atomic_get(&running) != 0; }
-bool sd_writer_failed(void)      { return atomic_get(&failed)  != 0; }
+bool sd_writer_is_running(void)  { return atomic_get(&running)    != 0; }
+bool sd_writer_failed(void)      { return atomic_get(&failed)     != 0; }
+bool sd_writer_is_rotating(void) { return atomic_get(&rotate_req) != 0; }
 
 int sd_writer_push_audio(void *slab_buf)
 {

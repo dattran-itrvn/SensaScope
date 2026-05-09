@@ -78,8 +78,26 @@ static int flush_to_file(void)
 		total += n;
 	}
 
+	int n_flushed = buf_n;
 	int ret = fs_write(&csv_file, flush_text, total);
 	buf_n = 0;
+	if (ret < 0) {
+		LOG_ERR("sampler: fs_write failed: %d", ret);
+		return ret;
+	}
+
+	/* #23 SD reliability fix: force the dirty FATFS sector cache down to
+	 * the card every flush (~1 Hz). Without this, a writer-thread death
+	 * or chip reset wipes everything cached — exactly the failure mode
+	 * we see as imu.csv = 0 B in SESSION_00001/3/7.
+	 */
+	int sret = fs_sync(&csv_file);
+	if (sret < 0) {
+		LOG_ERR("sampler: fs_sync failed: %d", sret);
+		return sret;
+	}
+	LOG_INF("sampler: flushed %d samples (total=%u, sync OK)",
+		n_flushed, samp_count);
 	return ret;
 }
 

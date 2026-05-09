@@ -44,10 +44,17 @@ static struct k_work  rotate_work;
  * aborts if either writer thread has silently exited (e.g. audio recorder
  * hit dmic_read/fs_write error and left rec_running=0 while the IMU
  * sampler kept going — the bug Cowork caught in #11 testing).
+ *
+ * #23: monitor also owns the .unsynced marker now. The marker is touched
+ * only after audio_recorder_bytes_written() > 0 for the current session,
+ * i.e. only once we know real data exists on the card. Crashed-empty
+ * sessions never get a marker, so BLE LIST naturally skips them.
  */
 #define MONITOR_INTERVAL_SEC  1
 static struct k_timer monitor_timer;
 static struct k_work  monitor_work;
+static uint32_t       unsynced_marker_id;   /* 0 = not yet set this session */
+static uint32_t       monitor_ticks;
 
 /* ---------- Helpers ---------- */
 static int statvfs_free_mb(uint32_t *mb_out)
@@ -193,8 +200,13 @@ static int touch_unsynced(uint32_t id)
 	return 0;
 }
 
-/* Open folder #id: mkdir, write meta, touch .unsynced. Caller owns audio
- * + imu writers. Returns 0 on success.
+/* Open folder #id: mkdir, write meta. Caller owns audio + imu writers.
+ * Returns 0 on success.
+ *
+ * #23: deliberately does NOT touch .unsynced anymore. The marker is set by
+ * the monitor watchdog only after the audio writer reports >0 bytes
+ * actually written, so empty sessions (writer crash before first write)
+ * never appear as sync targets.
  */
 static int prepare_folder(uint32_t id)
 {
@@ -206,8 +218,6 @@ static int prepare_folder(uint32_t id)
 		return ret;
 	}
 	ret = write_meta(id);
-	if (ret) return ret;
-	ret = touch_unsynced(id);
 	if (ret) return ret;
 	return 0;
 }
@@ -249,6 +259,7 @@ static void rotate_work_handler(struct k_work *w)
 	save_counter(next_id);
 	uint32_t old_id = current_id;
 	current_id = new_id;
+	unsynced_marker_id = 0;          /* #23: marker for the new id only */
 	LOG_INF("rotate: SESSION_%05u → SESSION_%05u", old_id, new_id);
 }
 
@@ -269,6 +280,33 @@ static void monitor_work_handler(struct k_work *w)
 	bool imu_alive    = imu_sampler_is_running();
 
 	if (audio_alive && imu_alive) {
+		uint32_t a_bytes = audio_recorder_bytes_written();
+
+		/* #23: set the .unsynced marker exactly once, after the audio
+		 * writer reports its first non-zero byte count for this
+		 * session. Sessions whose writer crashes before any data lands
+		 * never reach this branch and stay marker-less → BLE LIST will
+		 * skip them, no manual cleanup needed.
+		 */
+		if (unsynced_marker_id != current_id && a_bytes > 0) {
+			if (touch_unsynced(current_id) == 0) {
+				unsynced_marker_id = current_id;
+				LOG_INF("monitor: SESSION_%05u .unsynced marker "
+					"set (audio=%u B)", current_id, a_bytes);
+			}
+		}
+
+		/* Heartbeat every 5 s so RTT logs show progress without
+		 * spamming. Useful when chasing the empty-session bug — a
+		 * gap in this heartbeat tells us exactly when the writer died.
+		 */
+		monitor_ticks++;
+		if ((monitor_ticks % 5) == 0) {
+			LOG_INF("monitor: SESSION_%05u tick=%u, audio=%u B, "
+				"imu=%u samples",
+				current_id, monitor_ticks, a_bytes,
+				imu_sampler_samples_written());
+		}
 		return;  /* healthy */
 	}
 
@@ -357,8 +395,10 @@ int session_start(int batt_mv)
 		return ret;
 	}
 
-	current_id = id;
-	next_id    = id + 1;
+	current_id          = id;
+	next_id             = id + 1;
+	unsynced_marker_id  = 0;        /* #23: reset, monitor will set it */
+	monitor_ticks       = 0;
 	save_counter(next_id);
 	aborted = false;
 	active  = true;

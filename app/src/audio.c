@@ -17,6 +17,19 @@ LOG_MODULE_REGISTER(audio, LOG_LEVEL_INF);
  */
 #define PDM_BLOCK_COUNT   8
 
+/* Periodic fs_sync in the writer thread (#23 SD reliability fix).
+ *
+ * Without this, FATFS keeps written PCM in its 512 B sector cache and
+ * only flushes on fs_close(). If the writer thread dies, or the chip
+ * resets, *all* RAM-cached audio is lost → SESSION_NNNNN/audio.wav stays
+ * at 0 B even though dmic_read + fs_write returned OK for many blocks.
+ *
+ * 50 blocks × 100 ms = 5 s of audio between syncs. Each sync is one
+ * SPI burst (~5–20 ms) — well under our 800 ms mem-slab slack so it
+ * doesn't risk a PDM dropped block.
+ */
+#define SYNC_EVERY_BLOCKS 50
+
 K_MEM_SLAB_DEFINE_STATIC(pdm_slab, PDM_BLOCK_BYTES, PDM_BLOCK_COUNT, 4);
 
 static const struct device *const dmic_dev = DEVICE_DT_GET(PDM_NODE);
@@ -280,6 +293,23 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3)
 		rec_bytes += size;
 		blocks++;
 		k_mem_slab_free(&pdm_slab, buf);
+
+		/* Periodic flush to SD so a writer-thread death or chip reset
+		 * doesn't wipe the cached blocks. Also prints a heartbeat the
+		 * RTT log can use to confirm the writer is making progress.
+		 */
+		if ((blocks % SYNC_EVERY_BLOCKS) == 0) {
+			int sret = fs_sync(&rec_file);
+			if (sret < 0) {
+				LOG_ERR("recorder: fs_sync failed at %u B / "
+					"%u blocks: %d",
+					rec_bytes, blocks, sret);
+				atomic_set(&rec_failed, 1);
+				break;
+			}
+			LOG_INF("recorder: %u blocks, %u B (sync OK)",
+				blocks, rec_bytes);
+		}
 	}
 
 	dmic_trigger(dmic_dev, DMIC_TRIGGER_STOP);

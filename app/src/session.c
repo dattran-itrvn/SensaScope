@@ -1,13 +1,13 @@
 #include <zephyr/kernel.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/logging/log.h>
-#include <soc.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "audio.h"
+#include "device_id.h"
 #include "imu_sampler.h"
 #include "sd_log.h"
 #include "session.h"
@@ -50,13 +50,6 @@ static struct k_timer monitor_timer;
 static struct k_work  monitor_work;
 
 /* ---------- Helpers ---------- */
-static void chip_id_hex(char *out, size_t n)
-{
-	uint32_t hi = NRF_FICR->DEVICEID[1];
-	uint32_t lo = NRF_FICR->DEVICEID[0];
-	snprintf(out, n, "%08x%08x", (unsigned)hi, (unsigned)lo);
-}
-
 static int statvfs_free_mb(uint32_t *mb_out)
 {
 	struct fs_statvfs s;
@@ -156,9 +149,6 @@ static int write_meta(uint32_t id)
 		return ret;
 	}
 
-	char chip[24];
-	chip_id_hex(chip, sizeof(chip));
-
 	char body[384];
 	int n = snprintf(body, sizeof(body),
 		"{\n"
@@ -179,8 +169,8 @@ static int write_meta(uint32_t id)
 		FW_VERSION,
 		FW_BUILD_HASH,
 		batt_at_start,
-		chip,
-		chip);
+		identity_get_chip_id(),
+		identity_get_name());
 
 	fs_write(&f, body, n);
 	fs_close(&f);

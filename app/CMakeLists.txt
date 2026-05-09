@@ -16,6 +16,7 @@ target_sources(app PRIVATE
 	src/audio.c
 	src/sd_log.c
 	src/session.c
+	src/device_id.c
 )
 
 target_include_directories(app PRIVATE src)

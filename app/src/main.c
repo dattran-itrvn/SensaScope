@@ -23,6 +23,7 @@
 
 #include "led.h"
 #include "battery.h"
+#include "device_id.h"
 #include "imu.h"
 #include "imu_sampler.h"
 #include "audio.h"
@@ -170,6 +171,7 @@ int main(void)
 
 	if (audio_init() == 0 && sdlog_init() == 0) {
 		sdlog_append_boot_stamp();
+		identity_init();
 		int32_t pl, pr, ml, mr;
 		if (audio_record_to_wav(SMOKE_WAV_PATH, SMOKE_RECORD_S,
 					&pl, &pr, &ml, &mr) == 0) {

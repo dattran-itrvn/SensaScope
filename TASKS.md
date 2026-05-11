@@ -177,6 +177,13 @@ Decision matrix (handled by `playbooks/sd_stress_isolation.md`):
 - Added `sd_writer_is_rotating()` returning `atomic_get(&rotate_req)`.
 - session.c monitor now gates `touch_unsynced` on `!sd_writer_is_rotating()`. ENOENT race window closed at source — no more spurious err logs at rotate boundaries.
 
+**#29 ⏳ SD card EOL / `-116` SDMMC timeout (hardware-class, no firmware fix needed)**
+- Symptom: mid-session `sd: Failed to read from SDMMC -116` (-ETIME) → `Card read failed` → `fs_write -5` cascade → watchdog → FSM `ERROR`. Observed on the 30 GB SanDisk in #28 verify run (~93 s into SESSION_00005, after a clean rotate from SESSION_00004).
+- Different signature from #23/#25/#27 (software races); `-116` is the SD-SPI driver's hard timeout. Card has likely hit wear / bad cells after many stress cycles.
+- FSM behavior is correct: watchdog catches the writer death, transitions to ERROR (LED SOS), partial session has its `.unsynced` marker → PC sync tool will still pull what was written.
+- Mitigations: vet new cards with 5 × 420 s stress before production use; consider logging `sdhc_spi` retry counter in `meta.json` as telemetry (separate task); rotate cards on warning.
+- No firmware action; hardware-class. Track for visibility.
+
 [OBSOLETE — superseded by #25/#27 above; kept for history]
 
 

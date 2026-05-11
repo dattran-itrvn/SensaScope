@@ -178,3 +178,11 @@ Hard rules:
 ## Discovered
 
 (Append findings here. Format: ` - YYYY-MM-DD: short fact + one line of context.`)
+
+ - 2026-05-09: SD SPI clock on PCB v1.0 — leave at 24 MHz. Lowering to 8 MHz **breaks audio** because per-block `fs_write` exceeds the PDM mem-slab drain window (DMIC `-EAGAIN`); batching (#25 sd_writer) makes 8 MHz tolerable but gives no CRC benefit. Occasional `sdhc_spi: Bad data CRC` at 24 MHz is absorbed by driver retry — leave it.
+ - 2026-05-09: With one `sd_writer` consumer thread + 2 producer FIFOs (audio_msgq 16 × ptr, imu_msgq 128 × 20 B), FATFS lock contention disappears. Stress phase-6 went from 2/5 → 5/5. **All FATFS work (write, mkdir, meta, sync, header rewrite) must run on this one thread.**
+ - 2026-05-09: PDM `K_MEM_SLAB_DEFINE_STATIC(pdm_slab, ..., 16, 4)` — 1.6 s slack is the floor for safe operation with #25 sd_writer. 8 blocks (0.8 s) was on the edge; bumping to 16 hides the worst FATFS stalls.
+ - 2026-05-09: Cold-boot SD init flakiness ≈ 60 % is solved by `k_msleep(100)` in `sdlog_init` before `disk_access_init`. The retry loop (3 × 200 ms) added at the same time hasn't been observed to fire post-fix.
+ - 2026-05-09: With `SW1 OFF`, J-Link feeds 3.27 V through the SWD header — the chip runs, but `battery_read_mv()` returns noise on the floating VBATT divider. FSM trips to `LOW_BATT_HOLDOFF` immediately. For J-Link-only debug sessions, temporarily set `BATT_LOW_MV = 0` in `main.c`; revert to `3300` before any commit.
+ - 2026-05-09: `.unsynced` marker is now an **integrity signal**, not just a sync flag. Created by the watchdog only after `audio_recorder_bytes_written > 0`, gated by `!sd_writer_is_rotating()`. Folder without marker = crashed before first write = skip. Folder with marker but `audio.wav < 44 B` = placeholder-only crash (paranoia case).
+ - 2026-05-09: SD card 30 GB SanDisk is at end-of-life (`-116` SDMMC timeouts under sustained write); 122 GB SanDisk is the bench-trusted card. Track replacements; new cards should be vetted with 5 × 420 s stress before production use.

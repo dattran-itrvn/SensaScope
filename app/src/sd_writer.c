@@ -19,6 +19,17 @@ LOG_MODULE_REGISTER(sd_writer, LOG_LEVEL_INF);
 #define WRITER_TICK_MS       25
 #define SYNC_INTERVAL_MS     5000
 
+/* #30 resilience knobs. fs_*_retry catches transient SD timeouts (the
+ * card busy doing internal GC / wear-levelling — typical for -116/-EIO at
+ * rotate burst) and sleeps RETRY_BACKOFF_MS between attempts. Total worst-
+ * case stall per fs op = RETRY_MAX × RETRY_BACKOFF_MS ≈ 600 ms, well inside
+ * the PDM mem-slab slack (~1.6 s) and IMU msgq slack (~2.5 s).
+ */
+#define RETRY_MAX            3
+#define RETRY_BACKOFF_MS     200
+#define ROTATE_FAIL_LIMIT    3   /* consecutive rotate fails → abort session */
+#define ROTATE_SYNC_TIMEOUT  K_SECONDS(10)
+
 #define AUDIO_BLOCK_BYTES    (AUDIO_PDM_RATE_HZ * 100 / 1000   /* per 100 ms */ \
 			      * AUDIO_PDM_CHANNELS * (AUDIO_PDM_BIT_WIDTH / 8))
 /* = 16000 * 0.1 * 2 * 2 = 6400 — but production PDM_BLOCK_MS is 100 ms
@@ -38,11 +49,36 @@ static struct k_thread     writer_thread;
 
 static struct fs_file_t    audio_file;
 static struct fs_file_t    csv_file;
+/* #30: opened during do_rotate Phase 1, swapped into audio_file/csv_file at
+ * Phase 2 commit. Holding both old + new handles open lets us abort the
+ * rotate (close pending only, keep old active) if any new-side fs op fails.
+ */
+static struct fs_file_t    audio_file_pending;
+static struct fs_file_t    csv_file_pending;
 
 static atomic_t            running       = ATOMIC_INIT(0);
 static atomic_t            stop_req      = ATOMIC_INIT(0);
 static atomic_t            rotate_req    = ATOMIC_INIT(0);
 static atomic_t            failed        = ATOMIC_INIT(0);
+
+/* #30: synchronous rotate API. rotate_full() blocks on rotate_done until
+ * writer thread reports rotate_result. session.c needs the real outcome
+ * to decide whether to commit current_id / next_id.
+ */
+static struct k_sem        rotate_done;
+static int                 rotate_result;
+static uint32_t            rotate_consecutive_fails;
+static uint32_t            rotate_deferred_total;     /* monotonic stat */
+
+/* #32: synchronous touch-file API. session.c monitor needs to create the
+ * `.unsynced` marker; trước #32 nó gọi fs_open/close trực tiếp từ
+ * system_work_queue → SD card -116 timeout sau ~1-40 phút. Giờ chuyển
+ * request qua sd_writer thread, ngăn 2 thread đụng FATFS đồng thời.
+ */
+static atomic_t            touch_req     = ATOMIC_INIT(0);
+static char                touch_path_buf[64];
+static struct k_sem        touch_done;
+static int                 touch_result;
 
 static volatile uint32_t   audio_bytes;
 static volatile uint32_t   imu_samples;
@@ -64,6 +100,105 @@ static uint32_t            next_meta_len;
 static struct k_mutex      path_mtx;
 
 static const char          csv_header_str[] = "t_us,ax,ay,az,gx,gy,gz\n";
+
+/* ---------- #30 Retry + verify helpers ---------- */
+static inline bool is_transient_err(int ret)
+{
+	return ret == -EIO || ret == -ENXIO ||
+	       ret == -ETIMEDOUT || ret == -EAGAIN;
+}
+
+static int fs_open_retry(struct fs_file_t *f, const char *path, fs_mode_t flags)
+{
+	int ret = 0;
+	for (int i = 0; i < RETRY_MAX; i++) {
+		fs_file_t_init(f);
+		ret = fs_open(f, path, flags);
+		if (ret == 0 || !is_transient_err(ret)) return ret;
+		LOG_WRN("fs_open(%s) try %d/%d: %d — backoff %d ms",
+			path, i + 1, RETRY_MAX, ret, RETRY_BACKOFF_MS);
+		k_msleep(RETRY_BACKOFF_MS);
+	}
+	return ret;
+}
+
+static int fs_write_retry(struct fs_file_t *f, const void *data, size_t len)
+{
+	int ret = 0;
+	for (int i = 0; i < RETRY_MAX; i++) {
+		ret = fs_write(f, data, len);
+		if (ret >= 0 || !is_transient_err(ret)) return ret;
+		LOG_WRN("fs_write(%zu B) try %d/%d: %d — backoff %d ms",
+			len, i + 1, RETRY_MAX, ret, RETRY_BACKOFF_MS);
+		k_msleep(RETRY_BACKOFF_MS);
+	}
+	return ret;
+}
+
+static int fs_close_retry(struct fs_file_t *f)
+{
+	int ret = 0;
+	for (int i = 0; i < RETRY_MAX; i++) {
+		ret = fs_close(f);
+		if (ret == 0 || !is_transient_err(ret)) return ret;
+		LOG_WRN("fs_close try %d/%d: %d — backoff %d ms",
+			i + 1, RETRY_MAX, ret, RETRY_BACKOFF_MS);
+		k_msleep(RETRY_BACKOFF_MS);
+	}
+	return ret;
+}
+
+static int fs_seek_retry(struct fs_file_t *f, off_t off, int whence)
+{
+	int ret = 0;
+	for (int i = 0; i < RETRY_MAX; i++) {
+		ret = fs_seek(f, off, whence);
+		if (ret == 0 || !is_transient_err(ret)) return ret;
+		LOG_WRN("fs_seek try %d/%d: %d — backoff %d ms",
+			i + 1, RETRY_MAX, ret, RETRY_BACKOFF_MS);
+		k_msleep(RETRY_BACKOFF_MS);
+	}
+	return ret;
+}
+
+/* Catch the silent FAT corruption seen in #30 run 1 (SESSION_00007 came out
+ * as a 0-byte regular file even though mkdir + open + write returned success).
+ * fs_stat after mkdir confirms the entry on disk is genuinely a directory.
+ */
+static int verify_is_dir(const char *path)
+{
+	struct fs_dirent ent;
+	int ret = fs_stat(path, &ent);
+	if (ret) {
+		LOG_ERR("verify_is_dir(%s) stat: %d", path, ret);
+		return ret;
+	}
+	if (ent.type != FS_DIR_ENTRY_DIR) {
+		LOG_ERR("verify_is_dir(%s) entry is FILE not DIR — "
+			"silent FAT corruption, aborting rotate", path);
+		return -EBADF;
+	}
+	return 0;
+}
+
+static int verify_file_nonempty(const char *path)
+{
+	struct fs_dirent ent;
+	int ret = fs_stat(path, &ent);
+	if (ret) {
+		LOG_ERR("verify_file(%s) stat: %d", path, ret);
+		return ret;
+	}
+	if (ent.type != FS_DIR_ENTRY_FILE) {
+		LOG_ERR("verify_file(%s) type=%d not FILE", path, ent.type);
+		return -EBADF;
+	}
+	if (ent.size == 0) {
+		LOG_ERR("verify_file(%s) size=0 — write did not commit", path);
+		return -EBADF;
+	}
+	return 0;
+}
 
 /* ---------- WAV header (44 B canonical PCM) ---------- */
 static int write_wav_header(struct fs_file_t *f, uint32_t data_bytes)
@@ -92,50 +227,60 @@ static int write_wav_header(struct fs_file_t *f, uint32_t data_bytes)
 	memcpy(&hdr[36], "data",      4);
 	memcpy(&hdr[40], &data_bytes, 4);
 
-	fs_seek(f, 0, FS_SEEK_SET);
-	int ret = fs_write(f, hdr, sizeof(hdr));
+	int ret = fs_seek_retry(f, 0, FS_SEEK_SET);
+	if (ret) return ret;
+	ret = fs_write_retry(f, hdr, sizeof(hdr));
 	return ret < 0 ? ret : 0;
 }
 
 /* ---------- Helpers ---------- */
-static int open_pair(const char *audio_path, const char *csv_path)
+/* Open audio + csv pair into the given fs_file_t structs and write the
+ * placeholder WAV header + CSV header. Used by sd_writer_start (initial
+ * open into audio_file / csv_file) AND by do_rotate (open into the
+ * pending pair before swap).
+ */
+static int open_pair_into(struct fs_file_t *af, struct fs_file_t *cf,
+			  const char *audio_path, const char *csv_path)
 {
 	uint8_t pad[44] = {0};
 	int ret;
 
-	fs_file_t_init(&audio_file);
-	ret = fs_open(&audio_file, audio_path, FS_O_CREATE | FS_O_WRITE);
+	ret = fs_open_retry(af, audio_path, FS_O_CREATE | FS_O_WRITE);
 	if (ret) { LOG_ERR("open audio %s: %d", audio_path, ret); return ret; }
-	ret = fs_write(&audio_file, pad, sizeof(pad));
+	ret = fs_write_retry(af, pad, sizeof(pad));
 	if (ret < 0) {
 		LOG_ERR("audio header placeholder: %d", ret);
-		fs_close(&audio_file);
+		fs_close_retry(af);
 		return ret;
 	}
 
-	fs_file_t_init(&csv_file);
-	ret = fs_open(&csv_file, csv_path, FS_O_CREATE | FS_O_WRITE);
+	ret = fs_open_retry(cf, csv_path, FS_O_CREATE | FS_O_WRITE);
 	if (ret) {
 		LOG_ERR("open csv %s: %d", csv_path, ret);
-		fs_close(&audio_file);
+		fs_close_retry(af);
 		return ret;
 	}
-	ret = fs_write(&csv_file, csv_header_str, sizeof(csv_header_str) - 1);
+	ret = fs_write_retry(cf, csv_header_str, sizeof(csv_header_str) - 1);
 	if (ret < 0) {
 		LOG_ERR("csv header: %d", ret);
-		fs_close(&csv_file);
-		fs_close(&audio_file);
+		fs_close_retry(cf);
+		fs_close_retry(af);
 		return ret;
 	}
 	return 0;
+}
+
+static int open_pair(const char *audio_path, const char *csv_path)
+{
+	return open_pair_into(&audio_file, &csv_file, audio_path, csv_path);
 }
 
 static int finalize_pair(uint32_t audio_data_bytes)
 {
 	int ret = write_wav_header(&audio_file, audio_data_bytes);
 	if (ret) LOG_WRN("finalize: WAV header rewrite failed: %d", ret);
-	fs_close(&audio_file);
-	fs_close(&csv_file);
+	fs_close_retry(&audio_file);
+	fs_close_retry(&csv_file);
 	return ret;
 }
 
@@ -147,7 +292,7 @@ static int drain_audio(uint32_t *bytes_written_out)
 	void *buf;
 	uint32_t bytes_total = 0;
 	while (k_msgq_get(&audio_msgq, &buf, K_NO_WAIT) == 0) {
-		int ret = fs_write(&audio_file, buf, AUDIO_BLOCK_BYTES);
+		int ret = fs_write_retry(&audio_file, buf, AUDIO_BLOCK_BYTES);
 		audio_producer_release_slab(buf);   /* always free, even on err */
 		if (ret < 0) {
 			LOG_ERR("audio fs_write at %u B: %d", audio_bytes, ret);
@@ -184,7 +329,7 @@ static int drain_imu(void)
 		}
 		len += adv;
 	}
-	int ret = fs_write(&csv_file, text, len);
+	int ret = fs_write_retry(&csv_file, text, len);
 	if (ret < 0) {
 		LOG_ERR("imu fs_write %d samples / %d bytes: %d", n, len, ret);
 		return ret;
@@ -193,25 +338,28 @@ static int drain_imu(void)
 	return 0;
 }
 
-/* Service a pending rotate request — does ALL FATFS work in this thread,
- * so nothing else holds the FATFS lock during the transition. Sequence:
+/* #30 do_rotate — two-phase to allow defer-on-failure.
  *
- *   1. drain pending audio + imu queues into the *current* files
- *   2. finalize current WAV header, close both
- *   3. fs_mkdir new session folder
- *   4. open + write + close meta.json
- *   5. open new audio.wav (placeholder header) + new imu.csv (CSV header)
+ * Phase 1: prepare new folder + meta + open new audio/csv into PENDING
+ *          handles. Old handles still active. All fs ops are retry-wrapped
+ *          and verified (post-mkdir fs_stat for DIR attr, post-meta fs_stat
+ *          for size > 0). On any failure, close any partial pending handles
+ *          and return error — old session keeps writing to the same folder.
  *
- * If any step fails, returns < 0 with the failure logged; caller (the
- * thread loop) sets the failed flag.
+ * Phase 2: commit. Drain pending audio+imu into OLD handles, finalize
+ *          (rewrite WAV header, close OLD), swap pending → active. Reset
+ *          counters. The drain is moved AFTER the commit-point so an error
+ *          in Phase 1 doesn't lose pending data — those bytes stay in the
+ *          FIFOs and land in the old folder on the next loop iteration.
+ *
+ * Caller (writer thread) treats < 0 as deferred (after ROTATE_FAIL_LIMIT
+ * consecutive defers, escalates to failed=1 → FSM ERROR).
  */
 static int do_rotate(void)
 {
-	uint32_t junk;
 	int ret;
 
-	/* Snapshot the request first — caller's k_msgq_put might race the
-	 * mutex if we read piecewise. */
+	/* Snapshot args under mutex (paths + meta body). */
 	char folder[64], ap[64], cp[64];
 	char meta[sizeof(next_meta_body)];
 	uint32_t meta_n;
@@ -223,37 +371,68 @@ static int do_rotate(void)
 	meta_n = next_meta_len;
 	k_mutex_unlock(&path_mtx);
 
-	drain_audio(&junk);
-	drain_imu();
+	/* ===== Phase 1: prepare new (old handles still active) ===== */
 
-	ret = finalize_pair(audio_bytes);
-	if (ret) LOG_WRN("rotate finalize: %d", ret);
-
+	/* 1a. mkdir + verify DIR attribute (catches the silent-FAT-corruption
+	 *     case from run 1: mkdir returned 0 but on-disk entry came out as
+	 *     a regular file). EEXIST is fine as long as verify passes.
+	 */
 	ret = fs_mkdir(folder);
 	if (ret && ret != -EEXIST) {
 		LOG_ERR("rotate mkdir %s: %d", folder, ret);
 		return ret;
 	}
+	ret = verify_is_dir(folder);
+	if (ret) return ret;
 
-	/* meta.json — open + write + close in this thread, no contention. */
+	/* 1b. meta.json: open+write+close with retry, then stat-verify size>0. */
 	struct fs_file_t mf;
 	char meta_path[64];
 	snprintf(meta_path, sizeof(meta_path), "%s/meta.json", folder);
-	fs_file_t_init(&mf);
-	ret = fs_open(&mf, meta_path, FS_O_CREATE | FS_O_WRITE);
+	ret = fs_open_retry(&mf, meta_path, FS_O_CREATE | FS_O_WRITE);
 	if (ret) {
 		LOG_ERR("rotate meta open %s: %d", meta_path, ret);
 		return ret;
 	}
-	ret = fs_write(&mf, meta, meta_n);
-	if (ret < 0) LOG_WRN("rotate meta write: %d", ret);
-	fs_close(&mf);
+	int wret = fs_write_retry(&mf, meta, meta_n);
+	int cret = fs_close_retry(&mf);
+	if (wret < 0) {
+		LOG_ERR("rotate meta write: %d", wret);
+		return wret;
+	}
+	if (cret) {
+		LOG_ERR("rotate meta close: %d", cret);
+		return cret;
+	}
+	ret = verify_file_nonempty(meta_path);
+	if (ret) return ret;
 
-	ret = open_pair(ap, cp);
+	/* 1c. Open new audio + csv into PENDING handles, write placeholder
+	 *     headers. open_pair_into closes any opened-then-failed handle
+	 *     internally so we don't leak on partial failure.
+	 */
+	ret = open_pair_into(&audio_file_pending, &csv_file_pending, ap, cp);
 	if (ret) {
-		LOG_ERR("rotate open new pair failed: %d", ret);
+		LOG_ERR("rotate open new pair: %d", ret);
 		return ret;
 	}
+
+	/* ===== Phase 2: commit. From here on we MUST swap to keep state
+	 *      consistent — drain into OLD, finalize OLD, swap.
+	 *      Errors past this point are logged but not propagated. =====
+	 */
+	uint32_t junk;
+	drain_audio(&junk);
+	drain_imu();
+
+	int fret = finalize_pair(audio_bytes);
+	if (fret) LOG_WRN("rotate finalize old: %d", fret);
+
+	audio_file = audio_file_pending;
+	csv_file   = csv_file_pending;
+	fs_file_t_init(&audio_file_pending);
+	fs_file_t_init(&csv_file_pending);
+
 	LOG_INF("rotate: %s + %s opened (closed %u B audio in prev session)",
 		ap, cp, audio_bytes);
 
@@ -276,12 +455,53 @@ static void writer_thread_fn(void *p1, void *p2, void *p3)
 
 	while (!atomic_get(&stop_req)) {
 		if (atomic_get(&rotate_req)) {
-			if (do_rotate() < 0) {
-				atomic_set(&failed, 1);
-				atomic_clear(&rotate_req);
-				break;
+			int rr = do_rotate();
+			rotate_result = rr;
+			if (rr < 0) {
+				rotate_consecutive_fails++;
+				rotate_deferred_total++;
+				LOG_WRN("rotate deferred (%u/%u consecutive): "
+					"keeping old folder, will retry next "
+					"timer tick",
+					rotate_consecutive_fails,
+					(uint32_t)ROTATE_FAIL_LIMIT);
+				if (rotate_consecutive_fails >= ROTATE_FAIL_LIMIT) {
+					LOG_ERR("rotate failed %u times in a row "
+						"→ aborting session",
+						rotate_consecutive_fails);
+					atomic_set(&failed, 1);
+					atomic_clear(&rotate_req);
+					k_sem_give(&rotate_done);
+					break;
+				}
+			} else {
+				rotate_consecutive_fails = 0;
 			}
 			atomic_clear(&rotate_req);
+			k_sem_give(&rotate_done);
+		}
+
+		/* #32: service touch_file requests in-thread. session.c monitor
+		 * dùng cái này để tạo .unsynced marker, KHÔNG gọi fs_open trực
+		 * tiếp từ system_work_queue nữa. */
+		if (atomic_get(&touch_req)) {
+			struct fs_file_t f;
+			char path[sizeof(touch_path_buf)];
+
+			k_mutex_lock(&path_mtx, K_FOREVER);
+			strncpy(path, touch_path_buf, sizeof(path) - 1);
+			path[sizeof(path) - 1] = '\0';
+			k_mutex_unlock(&path_mtx);
+
+			int tret = fs_open_retry(&f, path,
+						 FS_O_CREATE | FS_O_WRITE);
+			if (tret == 0) {
+				int cret = fs_close_retry(&f);
+				if (cret) tret = cret;
+			}
+			touch_result = tret;
+			atomic_clear(&touch_req);
+			k_sem_give(&touch_done);
 		}
 
 		uint32_t audio_chunk = 0;
@@ -328,6 +548,13 @@ int sd_writer_start(const char *audio_path, const char *csv_path)
 	if (atomic_get(&running)) return -EALREADY;
 
 	k_mutex_init(&path_mtx);
+	k_sem_init(&rotate_done, 0, 1);
+	k_sem_init(&touch_done,  0, 1);
+	rotate_consecutive_fails = 0;
+	rotate_deferred_total    = 0;
+	rotate_result            = 0;
+	atomic_clear(&touch_req);
+	touch_result             = 0;
 	k_msgq_purge(&audio_msgq);
 	k_msgq_purge(&imu_msgq);
 
@@ -397,6 +624,11 @@ int sd_writer_rotate_full(const char *new_folder,
 	if (!atomic_get(&running)) return -ENOENT;
 	if (meta_len > sizeof(next_meta_body)) return -EMSGSIZE;
 
+	/* #30: drain any stale give from a previous abort (shouldn't happen
+	 * but defensive — k_sem_take with 0 timeout, returns -EAGAIN if empty.
+	 */
+	k_sem_reset(&rotate_done);
+
 	k_mutex_lock(&path_mtx, K_FOREVER);
 	strncpy(next_folder_buf, new_folder,    sizeof(next_folder_buf) - 1);
 	next_folder_buf[sizeof(next_folder_buf) - 1] = '\0';
@@ -407,8 +639,16 @@ int sd_writer_rotate_full(const char *new_folder,
 	memcpy(next_meta_body, meta_body, meta_len);
 	next_meta_len = meta_len;
 	k_mutex_unlock(&path_mtx);
+
+	rotate_result = -EBUSY;     /* in case sem times out */
 	atomic_set(&rotate_req, 1);
-	return 0;
+
+	int sret = k_sem_take(&rotate_done, ROTATE_SYNC_TIMEOUT);
+	if (sret) {
+		LOG_ERR("rotate: writer thread did not signal within timeout");
+		return -ETIMEDOUT;
+	}
+	return rotate_result;
 }
 
 bool sd_writer_is_running(void)  { return atomic_get(&running)    != 0; }
@@ -435,7 +675,31 @@ int sd_writer_push_imu(const struct sd_writer_imu_sample *sample)
 	return 0;
 }
 
-uint32_t sd_writer_audio_bytes_written(void) { return audio_bytes; }
-uint32_t sd_writer_imu_samples_written(void) { return imu_samples; }
-uint32_t sd_writer_audio_dropped(void)       { return audio_dropped; }
-uint32_t sd_writer_imu_dropped(void)         { return imu_dropped; }
+int sd_writer_touch_file(const char *path)
+{
+	if (!atomic_get(&running)) return -ENOENT;
+
+	k_sem_reset(&touch_done);
+
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	strncpy(touch_path_buf, path, sizeof(touch_path_buf) - 1);
+	touch_path_buf[sizeof(touch_path_buf) - 1] = '\0';
+	k_mutex_unlock(&path_mtx);
+
+	touch_result = -EBUSY;
+	atomic_set(&touch_req, 1);
+
+	int sret = k_sem_take(&touch_done, K_SECONDS(5));
+	if (sret) {
+		LOG_ERR("sd_writer_touch_file: writer thread did not "
+			"signal within timeout");
+		return -ETIMEDOUT;
+	}
+	return touch_result;
+}
+
+uint32_t sd_writer_audio_bytes_written(void)    { return audio_bytes; }
+uint32_t sd_writer_imu_samples_written(void)    { return imu_samples; }
+uint32_t sd_writer_audio_dropped(void)          { return audio_dropped; }
+uint32_t sd_writer_imu_dropped(void)            { return imu_dropped; }
+uint32_t sd_writer_rotate_deferred_total(void)  { return rotate_deferred_total; }

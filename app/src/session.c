@@ -195,20 +195,21 @@ static int write_meta(uint32_t id)
 	return 0;
 }
 
+/* #32: trước đây hàm này gọi fs_open + fs_close trực tiếp từ
+ * monitor_work_handler (chạy trên system_work_queue) → đụng sd_writer
+ * thread khi nó đang fs_write → SD card timeout `-116` sau 1-40 phút.
+ * Giờ route qua sd_writer_touch_file để chỉ sd_writer thread chạm FATFS.
+ * Xem `docs/POSTMORTEM_SD_WRITE_RELIABILITY.md`.
+ */
 static int touch_unsynced(uint32_t id)
 {
 	char path[64];
 	snprintf(path, sizeof(path), UNSYNCED_FMT, id);
-
-	struct fs_file_t f;
-	fs_file_t_init(&f);
-	int ret = fs_open(&f, path, FS_O_CREATE | FS_O_WRITE);
+	int ret = sd_writer_touch_file(path);
 	if (ret) {
-		LOG_ERR("unsynced open %s: %d", path, ret);
-		return ret;
+		LOG_ERR("touch_unsynced %s via sd_writer: %d", path, ret);
 	}
-	fs_close(&f);
-	return 0;
+	return ret;
 }
 
 /* Open folder #id: mkdir, write meta. Caller owns audio + imu writers.
@@ -239,14 +240,12 @@ static void rotate_work_handler(struct k_work *w)
 	ARG_UNUSED(w);
 	if (!active) return;
 
-	uint32_t free_mb = 0;
-	if (statvfs_free_mb(&free_mb) == 0 && free_mb < MIN_FREE_MB) {
-		LOG_WRN("rotate: only %u MB free — eviction is task #17, "
-			"continuing into next folder anyway", free_mb);
-		/* TODO #17: evict oldest synced folder; if none, stop session
-		 * and have main FSM transition to ERROR.
-		 */
-	}
+	/* #32: KHÔNG gọi statvfs_free_mb ở đây nữa. fs_statvfs đụng FATFS
+	 * volume mutex từ system_work_queue đồng thời với sd_writer's
+	 * fs_write → trigger -116 timeout (xem docs/POSTMORTEM_SD_WRITE_
+	 * RELIABILITY.md). Khi task #17 (eviction) làm tới, route qua
+	 * sd_writer_get_free_mb (API mới) thay vì gọi trực tiếp.
+	 */
 
 	/* #27: rotate no longer touches FATFS from the system_work_queue.
 	 * Compute folder + paths + meta body only; hand everything to
@@ -271,7 +270,13 @@ static void rotate_work_handler(struct k_work *w)
 	int rr = sd_writer_rotate_full(folder, audio_path, csv_path,
 				       meta, (uint32_t)meta_n);
 	if (rr) {
-		LOG_ERR("rotate: sd_writer_rotate_full failed: %d", rr);
+		/* #30: sd_writer kept old handles alive (defer-on-fail). We
+		 * stay on current_id; next rotate timer tick will retry into
+		 * the SAME new_id. After ROTATE_FAIL_LIMIT consecutive defers
+		 * sd_writer escalates to failed=1 → watchdog → ERROR. */
+		LOG_WRN("rotate deferred (sd_writer: %d, keep SESSION_%05u, "
+			"total deferred=%u)", rr, current_id,
+			sd_writer_rotate_deferred_total());
 		return;
 	}
 
@@ -327,16 +332,19 @@ static void monitor_work_handler(struct k_work *w)
 			}
 		}
 
-		/* Heartbeat every 5 s. Includes drop counters so we can see
-		 * back-pressure in real time. */
+		/* Heartbeat every 5 s. Includes drop + deferred-rotate
+		 * counters so we can see back-pressure / rotate resilience in
+		 * real time. */
 		monitor_ticks++;
 		if ((monitor_ticks % 5) == 0) {
 			LOG_INF("monitor: SESSION_%05u tick=%u, "
 				"audio=%u B, imu=%u samples, "
-				"dropped audio=%u imu=%u",
+				"dropped audio=%u imu=%u, "
+				"rotate_deferred=%u",
 				current_id, monitor_ticks, a_bytes, i_samp,
 				sd_writer_audio_dropped(),
-				sd_writer_imu_dropped());
+				sd_writer_imu_dropped(),
+				sd_writer_rotate_deferred_total());
 		}
 		return;  /* healthy */
 	}
@@ -414,6 +422,17 @@ int session_start(int batt_mv)
 	snprintf(audio_path, sizeof(audio_path), AUDIO_FMT, id);
 	snprintf(csv_path,   sizeof(csv_path),   CSV_FMT,   id);
 
+	/* #32: save_counter PHẢI gọi TRƯỚC sd_writer_start. Trước fix này,
+	 * save_counter chạy SAU khi sd_writer thread đã khởi động → 2 thread
+	 * cùng đụng FATFS → contend với volume mutex và stress card.
+	 * Đặt trước → khi save_counter chạm FATFS, chưa có ai khác động vào.
+	 * Nếu sd_writer_start fail sau đó, counter vẫn đã tăng — chỉ lãng phí
+	 * 1 session id (folder orphan, không có .unsynced marker nên BLE
+	 * LIST skip → vô hại).
+	 */
+	uint32_t new_next_id = id + 1;
+	save_counter(new_next_id);
+
 	ret = sd_writer_start(audio_path, csv_path);
 	if (ret) {
 		LOG_ERR("sd_writer_start failed: %d", ret);
@@ -421,10 +440,9 @@ int session_start(int batt_mv)
 	}
 
 	current_id          = id;
-	next_id             = id + 1;
+	next_id             = new_next_id;
 	unsynced_marker_id  = 0;        /* #23: reset, monitor will set it */
 	monitor_ticks       = 0;
-	save_counter(next_id);
 	aborted = false;
 	active  = true;
 

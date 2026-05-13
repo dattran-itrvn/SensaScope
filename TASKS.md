@@ -97,13 +97,26 @@ Configure `TAP_CFG`/`TAP_THS_6D`/`INT_DUR2`/`WAKE_UP_THS`/`MD1_CFG` per AN5040 r
 
 ---
 
+## ✅ v1.0 CLOSED — 2026-05-13
+
+Toàn bộ tiêu chí nghiệm thu trong `docs/REQUIREMENTS.md` đã pass. Verify production stack 1 giờ với fix #32: 5 rotations sạch, ~230 MB audio + ~31000 IMU samples, 0 drop, 0 FSM ERROR. Production firmware sẵn sàng cho bench-side data collection.
+
+Các task firmware liên quan đến v1.0 đều ✅ (bao gồm #1-#16, #18, #22-#28, #30, #32). Task #17 (marker + counter + ERROR path) ✅ phần v1.0; sub-feature eviction defer sang v1.1. Task #29 (SD card EOL) firmware-side đã đóng qua #32; hardware-side track trong `docs/PRODUCTION_TODO.md § Hardware / PCB v1.1+`.
+
+Bài học kỹ thuật quan trọng nhất của v1.0: `docs/POSTMORTEM_SD_WRITE_RELIABILITY.md` — "single-FATFS-owner" invariant của #25 nghiêm ngặt, mọi FATFS call ngoài sd_writer thread phải route qua public sync API.
+
+---
+
 ## v1.1 — BLE sync (full spec in `docs/SYNC_PROTOCOL.md`)
 
-**#17 ⏳ Session marker + persistent counter + free-space eviction**
-- Implement `.unsynced` 0-byte marker file written when a new session folder is created (overlaps with #12 — keep them in lockstep).
-- Persist next-session-id counter in `/SD/sync_state.json` (read on boot, increment on session create).
-- Free-space eviction logic: scan unsynced/synced folders, delete oldest synced when free < 100 MB.
-- ERROR-state entry path: SD full + no synced folders → set `state = ERROR`, LED SOS, refuse `session_start`.
+**#17 🟡 Session marker + persistent counter + free-space eviction** (v1.0 portion done; eviction = v1.1)
+- ✅ `.unsynced` 0-byte marker — implemented in #12; refined to integrity-signal in #23 (only created sau khi audio bytes > 0) và gated rotate-window trong #28.
+- ✅ Counter persistence `/SD/sync_state.json` — `load_counter` / `save_counter` / `scan_max_session_id` fallback (xem `session.c`); save chuyển trước `sd_writer_start` ở #32 để tránh contention.
+- ✅ ERROR-state entry path — FSM `APP_STATE_ERROR` đã có trong #14, SOS LED qua #13, watchdog catch trong session monitor.
+- ⏳ **Eviction (v1.1 only)** — phụ thuộc BLE sync để biết folder nào synced. Sẽ implement lúc làm #19/#21:
+  - Quét `/SD/SESSION_*`, phân loại synced (không có `.unsynced`) vs unsynced.
+  - Khi free < 100 MB và còn folder synced → xoá folder synced cũ nhất qua `sd_writer_remove_folder()` (API mới sẽ thêm sd_writer side, không gọi fs_unlink trực tiếp từ system_work_queue — invariant single-FATFS-owner của #32).
+  - Khi free < 100 MB và không còn folder synced → từ chối `session_start` → FSM `ERROR`.
 
 **#18 ✅ Device name file + chip-id fallback**
 - Read `/SD/device.name` (max 32 bytes UTF-8) on boot. Strip newline.
@@ -177,12 +190,12 @@ Decision matrix (handled by `playbooks/sd_stress_isolation.md`):
 - Added `sd_writer_is_rotating()` returning `atomic_get(&rotate_req)`.
 - session.c monitor now gates `touch_unsynced` on `!sd_writer_is_rotating()`. ENOENT race window closed at source — no more spurious err logs at rotate boundaries.
 
-**#29 ⏳ SD card EOL / `-116` SDMMC timeout (hardware-class, no firmware fix needed)**
-- Symptom: mid-session `sd: Failed to read from SDMMC -116` (-ETIME) → `Card read failed` → `fs_write -5` cascade → watchdog → FSM `ERROR`. Observed on the 30 GB SanDisk in #28 verify run (~93 s into SESSION_00005, after a clean rotate from SESSION_00004).
-- Different signature from #23/#25/#27 (software races); `-116` is the SD-SPI driver's hard timeout. Card has likely hit wear / bad cells after many stress cycles.
-- FSM behavior is correct: watchdog catches the writer death, transitions to ERROR (LED SOS), partial session has its `.unsynced` marker → PC sync tool will still pull what was written.
-- Mitigations: vet new cards with 5 × 420 s stress before production use; consider logging `sdhc_spi` retry counter in `meta.json` as telemetry (separate task); rotate cards on warning.
-- **Superseded for firmware-side handling by #30** — `-116` at rotate boundary is now retry-and-defer instead of one-shot ERROR.
+**#29 🟡 SD card EOL / `-116` SDMMC timeout** (hardware-class — firmware side đã đóng qua #32; hardware-side tracked trong `docs/PRODUCTION_TODO.md § Hardware / PCB v1.1+`)
+- Symptom: mid-session `sd: Failed to read from SDMMC -116` (-ETIME) → `Card read failed` → `fs_write -5` cascade → watchdog → FSM `ERROR`. Lần đầu thấy trên 30 GB SanDisk wear-out hồi #28.
+- Đợt diagnosis #32 confirm: ngay cả card mới (122 GB, format sạch) cũng có thể gặp `-116` nếu firmware có concurrent FATFS access từ system_work_queue → card stress → timeout. Fix #32 (single-FATFS-owner) loại bỏ trigger này.
+- Firmware behavior khi card thực sự fail: watchdog catches → ERROR (LED SOS), session cuối có `.unsynced` marker → PC sync tool vẫn pull được phần đã ghi. **Đúng — không cần thêm firmware work.**
+- Mitigation cấp operational (không firmware): vet card mới bằng 5 × 420 s stress trước production. Rotate card on warning. Telemetry `sdhc_spi` retry counter trong `meta.json` để giám sát wear — chưa làm, low priority.
+- Hardware-side note: SD card slot trên PCB v1.0 dùng wear-prone consumer cards. PCB v1.1+ nên xem xét: industrial SD slot, hoặc eMMC chip-on-board (loại trừ socket completely). Đã thêm vào `docs/PRODUCTION_TODO.md § Hardware`.
 
 **#32 ✅ SD write reliability — fix single-FATFS-owner violation**
 
@@ -198,7 +211,7 @@ Fix (3 changes):
 
 **Verify**: 1 giờ full production stack (auto-start, BLE on, default 10-phút rotation). Pass criterion: 0 FSM ERROR, 5+ rotation clean.
 
-**#30 🚧 SD write resilience — retry, verify, defer-on-rotate-fail**
+**#30 ✅ SD write resilience — retry, verify, defer-on-rotate-fail** (merged; 1-min stress passed 30 phút, nhưng production crash chính được giải bằng #32)
 Triggered by 1-min-rotation stress test (2 runs, both failed at rotate boundary): the write path has two latent flaws that #25/#27/#28 didn't address.
 
 **Bug 1 — Silent FAT corruption**: in run 1, `fs_mkdir + fs_open + fs_write` for SESSION_00007 all returned success codes, but on disk the entry came out as a 0-byte regular file (no `DIR` attribute bit). 3.84 MB of audio became orphan clusters. Firmware logged no error.

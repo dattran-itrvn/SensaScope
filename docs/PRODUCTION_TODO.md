@@ -44,6 +44,8 @@ The current sync protocol is **unauthenticated and unencrypted** at the applicat
 - [ ] Add 100K pull-up on LSM6DSL INT1 (cheap insurance against floating line if firmware bug disables push-pull).
 - [ ] Add hardware test point for PDM_DATA + PDM_CLK for scope debug.
 - [ ] Consider USB connector for fast bulk file dump (alternative to BLE) — would massively speed up sync.
+- [ ] **SD storage choice**: consumer micro-SD card slot trên PCB v1.0 thường gặp wear-out sớm (`-116 ETIME` sau vài chục giờ ghi liên tục với card class 10 phổ thông — xem #29 / `docs/POSTMORTEM_SD_WRITE_RELIABILITY.md`). Cân nhắc cho PCB v1.1: (a) chuyển sang **industrial-grade SD slot** + vetting card khi nhập kho; (b) thay bằng **eMMC chip-on-board** (loại trừ socket, tăng độ tin cậy, không thay được nhưng đời sống cao hơn); (c) thêm hardware power-cycle line cho SD slot để firmware có thể reset card sau khi gặp stuck-state mà không cần user can thiệp.
+- [ ] **SD card detect line**: chân `P0.26` (CARD_DETECT, 2M pull-up) chưa được firmware sử dụng. Nếu user thay card lúc đang record, không có cách phát hiện → corrupt FAT. PCB v1.1 nên giữ chân này + firmware v1.2 sẽ wire vào FSM (unmount safe).
 
 ## Compliance
 

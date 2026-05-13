@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """SensaPulse v1.1 — BLE sync CLI tool.
 
-This is a STUB. Claude Code should fill in the BLE bits per
-docs/SYNC_PROTOCOL.md. The CLI shape and on-disk layout are final.
+Implements the host side of `docs/SYNC_PROTOCOL.md`. Flow:
 
-Usage:
-    pip install bleak
-    python3 tools/sync.py --output ~/SensaScope_data
-    python3 tools/sync.py --output ~/SensaScope_data --device "Dat-chest-01"
-    python3 tools/sync.py --list-devices
-    python3 tools/sync.py --output ~/SensaScope_data --resume
+    scan → connect → fetch device info → LIST →
+    for each unsynced session:
+        READ audio.wav / imu.csv / meta.json (resumable)
+        rename .tmp → final
+        ACK   (removes .unsynced marker on device)
 
 On-disk layout (PC):
     <output>/<device_label>/SESSION_NNNNN/
@@ -18,6 +16,13 @@ On-disk layout (PC):
         └── meta.json
 
 `<device_label>` = device.name if set, else "device_<chip_id>".
+
+Usage:
+    pip install bleak
+    python3 tools/sync.py --output ~/SensaScope_data
+    python3 tools/sync.py --output ~/SensaScope_data --device "Dat-chest-01"
+    python3 tools/sync.py --list-devices
+    python3 tools/sync.py --output ~/SensaScope_data --resume
 """
 from __future__ import annotations
 
@@ -28,7 +33,6 @@ import logging
 import sys
 from pathlib import Path
 
-# pip install bleak
 try:
     from bleak import BleakClient, BleakScanner
 except ImportError:
@@ -49,13 +53,200 @@ OP_ABORT  = 0x04
 OP_DEL    = 0x05
 OP_RESET  = 0xFF
 
+ST_OK             = 0x00
+ST_BUSY           = 0x01
+ST_NOT_FOUND      = 0x02
+ST_ALREADY_SYNCED = 0x03
+ST_IO_ERR         = 0x04
+ST_INVALID        = 0x05
+
+STATUS_NAMES = {
+    ST_OK: "ok",
+    ST_BUSY: "busy",
+    ST_NOT_FOUND: "not_found",
+    ST_ALREADY_SYNCED: "already_synced",
+    ST_IO_ERR: "io_err",
+    ST_INVALID: "invalid",
+}
+
 FILE_NAMES = ["audio.wav", "imu.csv", "meta.json"]
 
 log = logging.getLogger("sync")
 
 
+class SyncSession:
+    """Wraps a connected BleakClient with notify dispatch for Control + Data.
+
+    Bleak's start_notify fires from the asyncio event loop, so per-opcode
+    asyncio.Queue is safe without locks. We hand each Control reply to a
+    queue keyed by opcode, and bulk Data chunks to a single queue consumed
+    by cmd_read.
+    """
+
+    def __init__(self, client: BleakClient):
+        self.client = client
+        self.ctrl_replies: dict[int, asyncio.Queue[bytes]] = {}
+        self.data_q: asyncio.Queue[bytes] = asyncio.Queue()
+
+    async def setup(self) -> None:
+        await self.client.start_notify(CHR_CONTROL, self._on_ctrl)
+        await self.client.start_notify(CHR_DATA, self._on_data)
+        # Reset device-side READ state in case the previous run left it dirty.
+        await self._raw_write(bytes([OP_RESET, 0]))
+        try:
+            await asyncio.wait_for(self._ctrl_queue(OP_RESET).get(), timeout=2.0)
+        except asyncio.TimeoutError:
+            log.debug("RESET_CTL: no reply (older firmware?)")
+
+    def _ctrl_queue(self, op: int) -> asyncio.Queue[bytes]:
+        return self.ctrl_replies.setdefault(op, asyncio.Queue())
+
+    def _on_ctrl(self, _char, data: bytearray) -> None:
+        if len(data) < 2:
+            log.warning("ctrl notify too short: %d byte", len(data))
+            return
+        op = data[0]
+        self._ctrl_queue(op).put_nowait(bytes(data))
+
+    def _on_data(self, _char, data: bytearray) -> None:
+        self.data_q.put_nowait(bytes(data))
+
+    async def _raw_write(self, frame: bytes) -> None:
+        await self.client.write_gatt_char(CHR_CONTROL, frame, response=True)
+
+    async def _await_ctrl(self, op: int, timeout: float) -> bytes:
+        return await asyncio.wait_for(self._ctrl_queue(op).get(), timeout=timeout)
+
+    async def fetch_info(self) -> dict:
+        raw = await self.client.read_gatt_char(CHR_DEVICE_INFO)
+        return json.loads(raw.decode("utf-8"))
+
+    async def cmd_list(self) -> list[tuple[int, int]]:
+        """Return [(session_id, total_bytes), ...] for unsynced sessions."""
+        await self._raw_write(bytes([OP_LIST, 0]))
+        reply = await self._await_ctrl(OP_LIST, timeout=30.0)
+        if reply[1] != ST_OK:
+            raise RuntimeError(f"LIST failed: status={STATUS_NAMES.get(reply[1], reply[1])}")
+        if len(reply) < 4:
+            raise RuntimeError(f"LIST reply too short: {len(reply)} byte")
+        n = reply[2] | (reply[3] << 8)
+        out: list[tuple[int, int]] = []
+        pos = 4
+        for _ in range(n):
+            if pos + 6 > len(reply):
+                raise RuntimeError(
+                    f"LIST reply truncated: expected {n} entries, got {len(out)}")
+            sid = reply[pos] | (reply[pos + 1] << 8)
+            sz = (reply[pos + 2] | (reply[pos + 3] << 8)
+                  | (reply[pos + 4] << 16) | (reply[pos + 5] << 24))
+            out.append((sid, sz))
+            pos += 6
+        return out
+
+    async def cmd_read(self, sid: int, file_idx: int, dest: Path,
+                       offset: int = 0, length: int = 0) -> tuple[int, int]:
+        """Stream one file. Returns (bytes_written_this_call, total_reported).
+
+        If `offset` > 0, dest is opened in append mode (resume).
+        `length=0` means "to EOF"; non-zero caps the device-side stream.
+        """
+        # Drain any leftover data chunks from a previous READ.
+        while not self.data_q.empty():
+            try:
+                self.data_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        frame = bytearray([OP_READ, 0])
+        frame += sid.to_bytes(2, "little")
+        frame += bytes([file_idx])
+        frame += offset.to_bytes(4, "little")
+        frame += length.to_bytes(4, "little")
+        await self._raw_write(bytes(frame))
+
+        ctrl_q = self._ctrl_queue(OP_READ)
+        mode = "ab" if offset > 0 else "wb"
+        bytes_written = 0
+        ctrl_reply: bytes | None = None
+
+        with dest.open(mode) as f:
+            while ctrl_reply is None:
+                data_task = asyncio.create_task(self.data_q.get())
+                ctrl_task = asyncio.create_task(ctrl_q.get())
+                done, pending = await asyncio.wait(
+                    [data_task, ctrl_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=15.0,
+                )
+                if not done:
+                    for t in pending:
+                        t.cancel()
+                    if not self.client.is_connected:
+                        raise ConnectionError(
+                            f"link dropped during READ "
+                            f"(sess={sid} file={file_idx} bytes={bytes_written})")
+                    raise TimeoutError(
+                        f"READ stalled: no data/ctrl for 15s "
+                        f"(sess={sid} file={file_idx} bytes={bytes_written})")
+                if ctrl_task in done:
+                    ctrl_reply = ctrl_task.result()
+                    # Drain any data chunks already queued before ctrl arrived.
+                    while not self.data_q.empty():
+                        chunk = self.data_q.get_nowait()
+                        if chunk:
+                            f.write(chunk)
+                            bytes_written += len(chunk)
+                    if not data_task.done():
+                        data_task.cancel()
+                    # Brief grace window for the last in-flight chunks:
+                    # device sends data chunks → 0-byte EOF → ctrl reply, but
+                    # the BLE driver can re-order delivery so a 40-200 byte
+                    # tail chunk may still be in transit when ctrl arrives.
+                    grace_deadline = asyncio.get_event_loop().time() + 0.5
+                    while True:
+                        remaining = grace_deadline - asyncio.get_event_loop().time()
+                        if remaining <= 0:
+                            break
+                        try:
+                            chunk = await asyncio.wait_for(self.data_q.get(),
+                                                            timeout=remaining)
+                        except asyncio.TimeoutError:
+                            break
+                        if chunk:
+                            f.write(chunk)
+                            bytes_written += len(chunk)
+                else:
+                    chunk = data_task.result()
+                    if chunk:
+                        f.write(chunk)
+                        bytes_written += len(chunk)
+                    if not ctrl_task.done():
+                        ctrl_task.cancel()
+
+        status = ctrl_reply[1]
+        if len(ctrl_reply) >= 6:
+            total = (ctrl_reply[2] | (ctrl_reply[3] << 8)
+                     | (ctrl_reply[4] << 16) | (ctrl_reply[5] << 24))
+        else:
+            total = bytes_written
+
+        if status != ST_OK:
+            raise RuntimeError(
+                f"READ failed sess={sid} file={file_idx}: "
+                f"status={STATUS_NAMES.get(status, status)}")
+        return bytes_written, total
+
+    async def cmd_ack(self, sid: int) -> None:
+        frame = bytearray([OP_ACK, 0])
+        frame += sid.to_bytes(2, "little")
+        await self._raw_write(bytes(frame))
+        reply = await self._await_ctrl(OP_ACK, timeout=10.0)
+        if reply[1] != ST_OK:
+            raise RuntimeError(
+                f"ACK sess={sid} failed: status={STATUS_NAMES.get(reply[1], reply[1])}")
+
+
 async def scan_for_devices(timeout: float = 5.0) -> list[tuple[str, str]]:
-    """Return list of (address, advertised_name) tuples for SensaPulse devices."""
     found: list[tuple[str, str]] = []
     devices = await BleakScanner.discover(timeout=timeout)
     for d in devices:
@@ -64,65 +255,112 @@ async def scan_for_devices(timeout: float = 5.0) -> list[tuple[str, str]]:
     return found
 
 
-async def fetch_device_info(client: BleakClient) -> dict:
-    raw = await client.read_gatt_char(CHR_DEVICE_INFO)
-    return json.loads(raw.decode("utf-8"))
-
-
-async def cmd_list(client: BleakClient) -> list[tuple[int, int]]:
-    """Return [(session_id, total_bytes), ...] for unsynced sessions."""
-    raise NotImplementedError("Claude Code: implement per SYNC_PROTOCOL.md")
-
-
-async def cmd_read(client: BleakClient, sid: int, file_idx: int, dest: Path) -> None:
-    """Stream one file via Data notifications, write to dest."""
-    raise NotImplementedError("Claude Code: implement per SYNC_PROTOCOL.md")
-
-
-async def cmd_ack(client: BleakClient, sid: int) -> None:
-    raise NotImplementedError("Claude Code: implement per SYNC_PROTOCOL.md")
-
-
 def device_label(info: dict) -> str:
-    name = info.get("name", "").strip()
+    name = (info.get("name") or "").strip()
     if name:
         return name
     return f"device_{info.get('chip_id', 'unknown')}"
 
 
-async def sync_one_device(addr: str, output_root: Path, resume: bool) -> int:
+def existing_partial_size(path: Path) -> int:
+    """For --resume: return current size on disk, or 0 if absent."""
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+async def transfer_session(sess: SyncSession, sid: int, total_hint: int,
+                           device_dir: Path, resume: bool, no_ack: bool,
+                           only_file_idx: int | None = None,
+                           max_bytes: int = 0) -> bool:
+    tmp = device_dir / f"SESSION_{sid:05d}.tmp"
+    final = device_dir / f"SESSION_{sid:05d}"
+    if final.exists():
+        if not resume:
+            log.info("session %d: already on disk → skipping (use --resume to redo)", sid)
+            return True
+        log.warning("session %d: final exists but device still has marker — re-ACK only", sid)
+        if not no_ack:
+            await sess.cmd_ack(sid)
+        return True
+
+    tmp.mkdir(parents=True, exist_ok=True)
+    log.info("session %d (~%d B): downloading to %s", sid, total_hint, tmp)
+
+    for fname, idx in zip(FILE_NAMES, range(len(FILE_NAMES))):
+        if only_file_idx is not None and idx != only_file_idx:
+            continue
+        dest = tmp / fname
+        offset = existing_partial_size(dest) if resume else 0
+        if offset > 0:
+            log.info("  %s: resuming from offset %d", fname, offset)
+        written, total = await sess.cmd_read(sid, idx, dest, offset=offset,
+                                              length=max_bytes)
+        log.info("  %s: +%d byte (file total %d)", fname, written, offset + written)
+        if total != offset + written:
+            log.warning("  %s: device reported total=%d, on-disk=%d",
+                        fname, total, offset + written)
+
+    tmp.rename(final)
+    if no_ack:
+        log.info("session %d: --no-ack, device marker preserved", sid)
+    else:
+        await sess.cmd_ack(sid)
+        log.info("session %d: ACK ok (marker removed on device)", sid)
+    return True
+
+
+async def sync_one_device(addr: str, output_root: Path, resume: bool,
+                          no_ack: bool, only_session: int | None,
+                          only_file_idx: int | None, max_bytes: int) -> int:
     async with BleakClient(addr) as client:
-        # 1. Negotiate connection params for throughput (PHY 2M, MTU 247).
-        # 2. Read device info, refuse if state != "idle".
-        # 3. List unsynced sessions, iterate.
-        # 4. For each session: download to <root>/<label>/SESSION_NNNNN.tmp/,
-        #    rename to final on success, then ACK.
-        info = await fetch_device_info(client)
-        log.info("connected: %s", info)
-        if info.get("state") != "idle":
-            log.error("device busy (state=%s) — sync aborted", info.get("state"))
+        sess = SyncSession(client)
+        await sess.setup()
+
+        info = await sess.fetch_info()
+        log.info("device info: %s", info)
+        state = info.get("state", "?")
+        # Per #20, IDLE → SYNC happens on BLE connect, so "sync" here is the
+        # expected post-connect state. RECORDING connect is rejected by the
+        # firmware before we get here, but guard anyway.
+        if state == "recording":
+            log.error("device is recording — sync refused")
             return 1
+        if state not in ("sync", "idle"):
+            log.warning("unexpected device state=%s — proceeding cautiously", state)
 
         label = device_label(info)
         device_dir = output_root / label
         device_dir.mkdir(parents=True, exist_ok=True)
+        log.info("output dir: %s", device_dir)
 
-        sessions = await cmd_list(client)
-        log.info("%d unsynced session(s)", len(sessions))
+        sessions = await sess.cmd_list()
+        log.info("LIST → %d unsynced session(s)", len(sessions))
+        if only_session is not None:
+            sessions = [s for s in sessions if s[0] == only_session]
+            log.info("--only-session %d → %d match", only_session, len(sessions))
+        if not sessions:
+            return 0
 
-        for sid, total_bytes in sessions:
-            tmp = device_dir / f"SESSION_{sid:05d}.tmp"
-            final = device_dir / f"SESSION_{sid:05d}"
-            if final.exists() and not resume:
-                log.info("skip session %d (already on disk, no --resume)", sid)
-                continue
-            tmp.mkdir(parents=True, exist_ok=True)
-            for fname, idx in zip(FILE_NAMES, range(len(FILE_NAMES))):
-                await cmd_read(client, sid, idx, tmp / fname)
-            tmp.rename(final)
-            await cmd_ack(client, sid)
-            log.info("session %d synced", sid)
-        return 0
+        failures = 0
+        for sid, total_hint in sessions:
+            if not client.is_connected:
+                log.error("link dropped — bailing out of remaining sessions")
+                failures += 1
+                break
+            try:
+                await transfer_session(sess, sid, total_hint, device_dir,
+                                       resume=resume, no_ack=no_ack,
+                                       only_file_idx=only_file_idx,
+                                       max_bytes=max_bytes)
+            except Exception as e:
+                log.error("session %d failed: %r", sid, e)
+                failures += 1
+                if not client.is_connected:
+                    log.error("link dropped — bailing out of remaining sessions")
+                    break
+        return 0 if failures == 0 else 2
 
 
 def main() -> int:
@@ -133,7 +371,18 @@ def main() -> int:
     p.add_argument("--list-devices", action="store_true",
                    help="scan and print SensaPulse devices, then exit")
     p.add_argument("--resume", action="store_true",
-                   help="re-attempt interrupted transfers")
+                   help="resume partial transfers from .tmp/ folders")
+    p.add_argument("--no-ack", action="store_true",
+                   help="debug: preserve .unsynced markers on device after transfer")
+    p.add_argument("--only-session", type=int, default=None,
+                   help="debug: sync only the given session id (skip others)")
+    p.add_argument("--only-file-idx", type=int, default=None,
+                   choices=[0, 1, 2],
+                   help="debug: only read this file index (0=audio, 1=imu, 2=meta)")
+    p.add_argument("--max-bytes", type=int, default=0,
+                   help="debug: cap READ length per file (0 = to EOF)")
+    p.add_argument("--scan-timeout", type=float, default=5.0,
+                   help="seconds to scan for devices (default: 5)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -142,14 +391,16 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    async def run():
+    async def run() -> int:
         if args.list_devices:
-            devs = await scan_for_devices()
+            devs = await scan_for_devices(args.scan_timeout)
+            if not devs:
+                print("(no SensaPulse devices found)")
             for addr, name in devs:
                 print(f"{addr}\t{name}")
             return 0
 
-        devs = await scan_for_devices()
+        devs = await scan_for_devices(args.scan_timeout)
         if not devs:
             log.error("no SensaPulse devices found")
             return 1
@@ -162,7 +413,14 @@ def main() -> int:
         rc = 0
         for addr, name in devs:
             log.info("syncing %s (%s)", name, addr)
-            rc |= await sync_one_device(addr, args.output, args.resume)
+            try:
+                code = await sync_one_device(addr, args.output, args.resume,
+                                             args.no_ack, args.only_session,
+                                             args.only_file_idx, args.max_bytes)
+            except Exception as e:
+                log.error("device %s failed: %r", name, e)
+                code = 1
+            rc = code if code > rc else rc
         return rc
 
     return asyncio.run(run())

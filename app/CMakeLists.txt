@@ -18,6 +18,7 @@ target_sources(app PRIVATE
 	src/sd_writer.c
 	src/session.c
 	src/device_id.c
+	src/ble_sync.c
 )
 
 target_include_directories(app PRIVATE src)

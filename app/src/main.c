@@ -30,6 +30,7 @@
 #include "sd_log.h"
 #include "sd_writer.h"
 #include "session.h"
+#include "ble_sync.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -196,6 +197,7 @@ static int start_ble(void)
 {
 	int err = bt_enable(NULL);
 	if (err) { LOG_ERR("bt_enable: %d", err); return err; }
+	ble_sync_init();
 	ble_adv_start();
 	return 0;
 }

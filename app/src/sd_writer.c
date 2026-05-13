@@ -4,8 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <stdlib.h>
+
 #include "audio.h"
 #include "imu_sampler.h"
+#include "sd_log.h"
 #include "sd_writer.h"
 
 LOG_MODULE_REGISTER(sd_writer, LOG_LEVEL_INF);
@@ -95,6 +98,14 @@ static uint8_t             write_body_buf[SD_WRITER_MAX_SMALL_FILE_BYTES];
 static size_t              write_body_len;
 static struct k_sem        write_done;
 static int                 write_result;
+
+/* #19.4: synchronous list-sessions API. */
+static atomic_t            list_req      = ATOMIC_INIT(0);
+static struct sd_writer_session_info *list_out;
+static uint32_t            list_max;
+static uint32_t            list_count;
+static struct k_sem        list_done;
+static int                 list_result;
 
 static volatile uint32_t   audio_bytes;
 static volatile uint32_t   imu_samples;
@@ -459,6 +470,57 @@ static int do_rotate(void)
 	return 0;
 }
 
+/* ---------- #19.4 SD session enumeration (runs in writer thread) ---------- */
+static int do_list_sessions(struct sd_writer_session_info *out,
+			    uint32_t max, uint32_t *count_out)
+{
+	*count_out = 0;
+	struct fs_dir_t dir;
+	fs_dir_t_init(&dir);
+	int ret = fs_opendir(&dir, SD_MOUNT_POINT);
+	if (ret) {
+		LOG_ERR("list: opendir: %d", ret);
+		return ret;
+	}
+
+	static const char *const files[] = { "audio.wav", "imu.csv", "meta.json" };
+	const size_t prefix = sizeof("SESSION_") - 1;
+
+	while (*count_out < max) {
+		struct fs_dirent ent;
+		if (fs_readdir(&dir, &ent) || ent.name[0] == '\0') break;
+		if (ent.type != FS_DIR_ENTRY_DIR) continue;
+		if (strncmp(ent.name, "SESSION_", prefix) != 0) continue;
+		uint32_t id = strtoul(ent.name + prefix, NULL, 10);
+		if (id == 0 || id > UINT16_MAX) continue;
+
+		uint32_t total = 0;
+		for (size_t f = 0; f < ARRAY_SIZE(files); f++) {
+			char p[80];
+			snprintf(p, sizeof(p), "%s/%s/%s",
+				 SD_MOUNT_POINT, ent.name, files[f]);
+			struct fs_dirent s;
+			if (fs_stat(p, &s) == 0 && s.type == FS_DIR_ENTRY_FILE) {
+				total += (uint32_t)s.size;
+			}
+		}
+
+		char marker[80];
+		snprintf(marker, sizeof(marker), "%s/%s/.unsynced",
+			 SD_MOUNT_POINT, ent.name);
+		struct fs_dirent ms;
+		bool unsynced = (fs_stat(marker, &ms) == 0);
+
+		out[*count_out].session_id  = (uint16_t)id;
+		out[*count_out].size_bytes  = total;
+		out[*count_out].is_unsynced = unsynced;
+		(*count_out)++;
+	}
+	fs_closedir(&dir);
+	LOG_INF("list_sessions: %u entries scanned", *count_out);
+	return 0;
+}
+
 /* ---------- Consumer thread ---------- */
 static void writer_thread_fn(void *p1, void *p2, void *p3)
 {
@@ -520,6 +582,14 @@ static void writer_thread_fn(void *p1, void *p2, void *p3)
 			touch_result = tret;
 			atomic_clear(&touch_req);
 			k_sem_give(&touch_done);
+		}
+
+		/* #19.4: service list_sessions requests in-thread. */
+		if (atomic_get(&list_req)) {
+			list_result = do_list_sessions(list_out, list_max,
+						       &list_count);
+			atomic_clear(&list_req);
+			k_sem_give(&list_done);
 		}
 
 		/* #19.3: service write_file requests in-thread (Set Name, etc.) */
@@ -620,6 +690,7 @@ int sd_writer_init(void)
 	k_sem_init(&rotate_done, 0, 1);
 	k_sem_init(&touch_done,  0, 1);
 	k_sem_init(&write_done,  0, 1);
+	k_sem_init(&list_done,   0, 1);
 
 	atomic_clear(&running);
 	atomic_clear(&stop_req);
@@ -627,6 +698,7 @@ int sd_writer_init(void)
 	atomic_clear(&failed);
 	atomic_clear(&touch_req);
 	atomic_clear(&write_req);
+	atomic_clear(&list_req);
 
 	atomic_set(&thread_alive, 1);
 
@@ -782,6 +854,33 @@ int sd_writer_write_file(const char *path, const void *body, size_t len)
 		return -ETIMEDOUT;
 	}
 	return write_result;
+}
+
+int sd_writer_list_sessions(struct sd_writer_session_info *out,
+			    uint32_t max, uint32_t *count_out)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	if (!out || !count_out || max == 0) return -EINVAL;
+	if (max > SD_WRITER_LIST_MAX) max = SD_WRITER_LIST_MAX;
+
+	k_sem_reset(&list_done);
+
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	list_out   = out;
+	list_max   = max;
+	list_count = 0;
+	k_mutex_unlock(&path_mtx);
+
+	list_result = -EBUSY;
+	atomic_set(&list_req, 1);
+
+	int sret = k_sem_take(&list_done, K_SECONDS(10));
+	if (sret) {
+		LOG_ERR("sd_writer_list_sessions: timeout");
+		return -ETIMEDOUT;
+	}
+	*count_out = list_count;
+	return list_result;
 }
 
 int sd_writer_touch_file(const char *path)

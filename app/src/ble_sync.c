@@ -13,6 +13,7 @@
 #include <zephyr/logging/log.h>
 
 #include <stdio.h>
+#include <string.h>
 
 #include "ble_sync.h"
 #include "device_id.h"
@@ -42,9 +43,31 @@ static struct bt_uuid_128 uuid_ctrl = BT_UUID_INIT_128(UUID128(0x7e7e0003));
 static struct bt_uuid_128 uuid_data = BT_UUID_INIT_128(UUID128(0x7e7e0004));
 static struct bt_uuid_128 uuid_name = BT_UUID_INIT_128(UUID128(0x7e7e0005));
 
-/* ---------- Subscriber tracking ---------- */
+/* ---------- Subscriber + connection tracking ---------- */
 static bool ctrl_subscribed;
 static bool data_subscribed;
+static struct bt_conn *current_conn;          /* refcounted; cleared on disconnect */
+
+static void track_connected(struct bt_conn *conn, uint8_t err)
+{
+	if (err) return;
+	if (current_conn) bt_conn_unref(current_conn);
+	current_conn = bt_conn_ref(conn);
+}
+
+static void track_disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	ARG_UNUSED(conn); ARG_UNUSED(reason);
+	if (current_conn) {
+		bt_conn_unref(current_conn);
+		current_conn = NULL;
+	}
+}
+
+BT_CONN_CB_DEFINE(ble_sync_conn_cb) = {
+	.connected    = track_connected,
+	.disconnected = track_disconnected,
+};
 
 static void ctrl_ccc_cfg(const struct bt_gatt_attr *attr, uint16_t value)
 {
@@ -58,6 +81,89 @@ static void data_ccc_cfg(const struct bt_gatt_attr *attr, uint16_t value)
 	ARG_UNUSED(attr);
 	data_subscribed = (value == BT_GATT_CCC_NOTIFY);
 	LOG_INF("Data CCC = %u (subscribed=%d)", value, data_subscribed);
+}
+
+/* ---------- Opcode framing (per docs/SYNC_PROTOCOL.md) ---------- */
+#define OP_LIST       0x01
+#define OP_READ       0x02
+#define OP_ACK        0x03
+#define OP_ABORT      0x04
+#define OP_DEL        0x05
+#define OP_RESET_CTL  0xFF
+
+#define ST_OK             0x00
+#define ST_BUSY           0x01
+#define ST_NOT_FOUND      0x02
+#define ST_ALREADY_SYNCED 0x03
+#define ST_IO_ERR         0x04
+#define ST_INVALID        0x05
+
+/* Service attribute indices (xem BT_GATT_SERVICE_DEFINE phía dưới):
+ *   0 primary, 1 info-decl, 2 info-value,
+ *   3 ctrl-decl, 4 ctrl-value, 5 ctrl-ccc,
+ *   6 data-decl, 7 data-value, 8 data-ccc,
+ *   9 name-decl, 10 name-value
+ */
+#define ATTR_CTRL_VAL  4
+#define ATTR_DATA_VAL  7
+
+extern const struct bt_gatt_service_static ble_sync_svc;
+
+static int ctrl_notify(const uint8_t *frame, size_t len)
+{
+	if (!current_conn) {
+		LOG_WRN("ctrl_notify: no connection");
+		return -ENOTCONN;
+	}
+	if (!ctrl_subscribed) {
+		LOG_WRN("ctrl_notify: client not subscribed (CCC=0)");
+		return -EACCES;
+	}
+	return bt_gatt_notify(current_conn,
+			      &ble_sync_svc.attrs[ATTR_CTRL_VAL],
+			      frame, len);
+}
+
+/* ---------- LIST handler — #19.4 (deferred to k_work) ---------- */
+static struct k_work list_work;
+
+static void list_work_handler(struct k_work *w)
+{
+	ARG_UNUSED(w);
+
+	static struct sd_writer_session_info sessions[SD_WRITER_LIST_MAX];
+	uint32_t count = 0;
+	int ret = sd_writer_list_sessions(sessions, SD_WRITER_LIST_MAX, &count);
+
+	uint8_t frame[4 + SD_WRITER_LIST_MAX * 6];
+	frame[0] = OP_LIST;
+	frame[1] = (ret == 0) ? ST_OK : ST_IO_ERR;
+
+	uint16_t n_unsynced = 0;
+	size_t   pos = 4;
+	if (ret == 0) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (!sessions[i].is_unsynced) continue;
+			if (pos + 6 > sizeof(frame)) break;
+			uint16_t sid = sessions[i].session_id;
+			uint32_t sz  = sessions[i].size_bytes;
+			frame[pos + 0] = sid       & 0xff;
+			frame[pos + 1] = (sid >> 8) & 0xff;
+			frame[pos + 2] = sz        & 0xff;
+			frame[pos + 3] = (sz >> 8) & 0xff;
+			frame[pos + 4] = (sz >> 16) & 0xff;
+			frame[pos + 5] = (sz >> 24) & 0xff;
+			pos += 6;
+			n_unsynced++;
+		}
+	}
+	frame[2] = n_unsynced & 0xff;
+	frame[3] = (n_unsynced >> 8) & 0xff;
+
+	LOG_INF("LIST: %u unsynced of %u total → notify %zu B",
+		n_unsynced, count, pos);
+	int nret = ctrl_notify(frame, pos);
+	if (nret) LOG_ERR("LIST notify: %d", nret);
 }
 
 /* ---------- Device Info (read) — #19.2 ---------- */
@@ -100,9 +206,30 @@ static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	const uint8_t *p = buf;
-	LOG_INF("Control write: opcode=0x%02x, status=0x%02x, len=%u (stub — #19.4+ fill)",
-		p[0], p[1], len);
-	return len;
+	uint8_t op = p[0];
+	LOG_INF("Control write: opcode=0x%02x len=%u", op, len);
+
+	switch (op) {
+	case OP_LIST:
+		k_work_submit(&list_work);
+		return len;
+	case OP_READ:
+	case OP_ACK:
+	case OP_ABORT:
+	case OP_DEL:
+	case OP_RESET_CTL: {
+		/* Stubs cho #19.5 / #19.6 — trả lỗi ST_INVALID tạm thời. */
+		uint8_t reply[2] = { op, ST_INVALID };
+		ctrl_notify(reply, sizeof(reply));
+		LOG_WRN("opcode 0x%02x not implemented yet (#19.5+)", op);
+		return len;
+	}
+	default: {
+		uint8_t reply[2] = { op, ST_INVALID };
+		ctrl_notify(reply, sizeof(reply));
+		return len;
+	}
+	}
 }
 
 /* ---------- Set Name (write) — #19.3 ---------- */
@@ -168,6 +295,7 @@ BT_GATT_SERVICE_DEFINE(ble_sync_svc,
 
 int ble_sync_init(void)
 {
+	k_work_init(&list_work, list_work_handler);
 	LOG_INF("Sync Service registered (UUID base 7e7e0001-...).");
 	return 0;
 }

@@ -141,3 +141,22 @@ int sd_writer_touch_file(const char *path);
  */
 #define SD_WRITER_MAX_SMALL_FILE_BYTES 64
 int sd_writer_write_file(const char *path, const void *body, size_t len);
+
+/* #19.4: list SESSION_NNNNN folders on SD. Scan từ sd_writer thread (giữ
+ * single-FATFS-owner). Caller cấp out array; thread fill `count_out` entry
+ * theo readdir order (typically ascending session id). Mỗi entry chứa
+ * id (1..65535), tổng bytes của audio.wav + imu.csv + meta.json, và flag
+ * is_unsynced (true = folder có `.unsynced` marker, chưa được PC ACK).
+ *
+ * Trả `-ENOENT` nếu thread chưa init. `max` ≤ SD_WRITER_LIST_MAX.
+ */
+#define SD_WRITER_LIST_MAX 40
+
+struct sd_writer_session_info {
+	uint16_t session_id;
+	uint32_t size_bytes;
+	bool     is_unsynced;
+};
+
+int sd_writer_list_sessions(struct sd_writer_session_info *out,
+			    uint32_t max, uint32_t *count_out);

@@ -119,13 +119,36 @@ static int ctrl_notify(const uint8_t *frame, size_t len)
 		LOG_WRN("ctrl_notify: client not subscribed (CCC=0)");
 		return -EACCES;
 	}
+	for (int i = 0; i < 20; i++) {
+		int ret = bt_gatt_notify(current_conn,
+					 &ble_sync_svc.attrs[ATTR_CTRL_VAL],
+					 frame, len);
+		if (ret == 0) return 0;
+		if (ret != -ENOMEM && ret != -EAGAIN) return ret;
+		k_msleep(5);
+	}
+	return -EIO;
+}
+
+static int data_notify(const uint8_t *frame, size_t len)
+{
+	if (!current_conn) return -ENOTCONN;
+	if (!data_subscribed) return -EACCES;
 	return bt_gatt_notify(current_conn,
-			      &ble_sync_svc.attrs[ATTR_CTRL_VAL],
+			      &ble_sync_svc.attrs[ATTR_DATA_VAL],
 			      frame, len);
 }
 
 /* ---------- LIST handler — #19.4 (deferred to k_work) ---------- */
 static struct k_work list_work;
+
+/* READ state — #19.5 (declared early so ctrl_write_cb above can stash params). */
+static struct k_work read_work;
+static uint16_t      read_session_id;
+static uint8_t       read_file_index;
+static uint32_t      read_offset_req;
+static uint32_t      read_length_req;
+static atomic_t      read_abort_flag = ATOMIC_INIT(0);
 
 static void list_work_handler(struct k_work *w)
 {
@@ -214,14 +237,34 @@ static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 		k_work_submit(&list_work);
 		return len;
 	case OP_READ:
-	case OP_ACK:
+		if (len < 13) {
+			uint8_t reply[2] = { op, ST_INVALID };
+			ctrl_notify(reply, sizeof(reply));
+			return len;
+		}
+		read_session_id = p[2] | (p[3] << 8);
+		read_file_index = p[4];
+		read_offset_req = p[5] | (p[6] << 8) | (p[7] << 16) | (p[8] << 24);
+		read_length_req = p[9] | (p[10] << 8) | (p[11] << 16) | (p[12] << 24);
+		LOG_INF("READ submit: sess=%u file=%u offset=%u length=%u",
+			read_session_id, read_file_index,
+			read_offset_req, read_length_req);
+		k_work_submit(&read_work);
+		return len;
 	case OP_ABORT:
+		atomic_set(&read_abort_flag, 1);
+		{
+			uint8_t reply[2] = { op, ST_OK };
+			ctrl_notify(reply, sizeof(reply));
+		}
+		return len;
+	case OP_ACK:
 	case OP_DEL:
 	case OP_RESET_CTL: {
-		/* Stubs cho #19.5 / #19.6 — trả lỗi ST_INVALID tạm thời. */
+		/* Stubs cho #19.6 — trả lỗi ST_INVALID tạm thời. */
 		uint8_t reply[2] = { op, ST_INVALID };
 		ctrl_notify(reply, sizeof(reply));
-		LOG_WRN("opcode 0x%02x not implemented yet (#19.5+)", op);
+		LOG_WRN("opcode 0x%02x not implemented yet (#19.6)", op);
 		return len;
 	}
 	default: {
@@ -230,6 +273,93 @@ static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 		return len;
 	}
 	}
+}
+
+/* ---------- READ + Data streaming — #19.5 (deferred to k_work) ---------- */
+
+static const char *file_index_to_name(uint8_t idx)
+{
+	switch (idx) {
+	case 0: return "audio.wav";
+	case 1: return "imu.csv";
+	case 2: return "meta.json";
+	default: return NULL;
+	}
+}
+
+static int read_chunk_cb(const uint8_t *chunk, uint32_t len, void *user)
+{
+	ARG_UNUSED(user);
+	if (atomic_get(&read_abort_flag)) return -ECANCELED;
+	/* Retry với backoff khi ATT TX buffer hết. PC consumes notifies tại
+	 * BLE connection interval (~7.5-15 ms). Backoff 5 ms × 20 = 100 ms
+	 * total — đủ cho buffer drain ở host side mà không stall nhiều.
+	 * Bottleneck tổng thể vẫn ở connection-interval, không phải ở đây. */
+	for (int i = 0; i < 20; i++) {
+		if (atomic_get(&read_abort_flag)) return -ECANCELED;
+		int ret = data_notify(chunk, len);
+		if (ret == 0) return 0;
+		if (ret != -ENOMEM && ret != -EAGAIN) {
+			LOG_ERR("read_chunk_cb: data_notify: %d", ret);
+			return -EIO;
+		}
+		k_msleep(5);
+	}
+	LOG_ERR("read_chunk_cb: TX buffer stuck after retries");
+	return -EIO;
+}
+
+static void read_work_handler(struct k_work *w)
+{
+	ARG_UNUSED(w);
+
+	const char *fname = file_index_to_name(read_file_index);
+	if (!fname) {
+		uint8_t reply[2] = { OP_READ, ST_INVALID };
+		ctrl_notify(reply, sizeof(reply));
+		return;
+	}
+
+	char path[80];
+	snprintf(path, sizeof(path), SD_MOUNT_POINT "/SESSION_%05u/%s",
+		 read_session_id, fname);
+
+	atomic_clear(&read_abort_flag);
+
+	/* First chunk callback hasn't fired yet — we need total_size before
+	 * sending the Control "total bytes" reply. sd_writer_read_file fills
+	 * total_out BEFORE streaming. Use 2-step: open via sd_writer's
+	 * built-in flow (it stat+seek+stream), but we need total upfront.
+	 * Workaround: call read_file with cb that captures total then proceeds.
+	 *
+	 * Simpler: send the Control reply AFTER read_file returns, including
+	 * a status of OK + total. PC tool currently expects total BEFORE
+	 * Data chunks — not great, but workable for v1.1 dev: PC counts bytes
+	 * received until 0-byte terminator. Send total reply at the END as
+	 * confirmation. */
+
+	uint32_t total = 0;
+	int ret = sd_writer_read_file(path, read_offset_req, read_length_req,
+				      read_chunk_cb, NULL, &total);
+
+	/* Send 0-byte Data notify as EOF terminator (per spec). */
+	data_notify(NULL, 0);
+
+	/* Control reply with final status + total bytes streamed. */
+	uint8_t reply[6];
+	reply[0] = OP_READ;
+	reply[1] = (ret == 0) ? ST_OK :
+		   (ret == -ENOENT) ? ST_NOT_FOUND :
+		   (ret == -ECANCELED) ? ST_OK :     /* ABORT counted as OK-abort */
+		   ST_IO_ERR;
+	reply[2] = total & 0xff;
+	reply[3] = (total >> 8) & 0xff;
+	reply[4] = (total >> 16) & 0xff;
+	reply[5] = (total >> 24) & 0xff;
+	ctrl_notify(reply, sizeof(reply));
+
+	LOG_INF("READ done: %s offset=%u length=%u → %u byte, ret=%d",
+		path, read_offset_req, read_length_req, total, ret);
 }
 
 /* ---------- Set Name (write) — #19.3 ---------- */
@@ -296,6 +426,7 @@ BT_GATT_SERVICE_DEFINE(ble_sync_svc,
 int ble_sync_init(void)
 {
 	k_work_init(&list_work, list_work_handler);
+	k_work_init(&read_work, read_work_handler);
 	LOG_INF("Sync Service registered (UUID base 7e7e0001-...).");
 	return 0;
 }

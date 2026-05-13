@@ -160,3 +160,15 @@ struct sd_writer_session_info {
 
 int sd_writer_list_sessions(struct sd_writer_session_info *out,
 			    uint32_t max, uint32_t *count_out);
+
+/* #19.5: streaming file read for BLE Data notify. Callback `cb` được gọi
+ * mỗi chunk từ sd_writer thread; ble_sync truyền cb thực hiện bt_gatt_notify.
+ * cb trả `< 0` để abort (vd ABORT opcode hoặc disconnect). `length=0` =
+ * đọc đến EOF. `total_out` (nullable) trả tổng số byte sẽ đọc trước khi
+ * stream bắt đầu. Trả `-ENOENT` nếu file không tồn tại hoặc thread chưa init.
+ */
+typedef int (*sd_writer_read_cb)(const uint8_t *chunk, uint32_t len, void *user);
+
+int sd_writer_read_file(const char *path, uint32_t offset, uint32_t length,
+			sd_writer_read_cb cb, void *user,
+			uint32_t *total_out);

@@ -107,6 +107,17 @@ static uint32_t            list_count;
 static struct k_sem        list_done;
 static int                 list_result;
 
+/* #19.5: streaming read API — open file, loop chunks via callback, close. */
+static atomic_t            read_req      = ATOMIC_INIT(0);
+static const char         *read_path;
+static uint32_t            read_offset;
+static uint32_t            read_length;       /* 0 = to EOF */
+static sd_writer_read_cb   read_cb;
+static void               *read_user;
+static uint32_t            read_total_size;   /* set by op, returned to caller */
+static struct k_sem        read_done;
+static int                 read_result;
+
 static volatile uint32_t   audio_bytes;
 static volatile uint32_t   imu_samples;
 static volatile uint32_t   audio_dropped;
@@ -521,6 +532,68 @@ static int do_list_sessions(struct sd_writer_session_info *out,
 	return 0;
 }
 
+/* ---------- #19.5 streaming read (runs in writer thread) ---------- */
+#define READ_CHUNK_BYTES  240   /* fits MTU 247 notify (header 3 + payload) */
+
+static int do_read_file(const char *path, uint32_t offset, uint32_t length,
+			sd_writer_read_cb cb, void *user, uint32_t *total_out)
+{
+	struct fs_file_t f;
+	fs_file_t_init(&f);
+	int ret = fs_open_retry(&f, path, FS_O_READ);
+	if (ret) {
+		LOG_ERR("read_file: open %s: %d", path, ret);
+		if (total_out) *total_out = 0;
+		return ret;
+	}
+
+	struct fs_dirent s;
+	uint32_t file_size = 0;
+	if (fs_stat(path, &s) == 0) file_size = (uint32_t)s.size;
+
+	if (offset > file_size) {
+		fs_close_retry(&f);
+		if (total_out) *total_out = 0;
+		return -EINVAL;
+	}
+
+	uint32_t to_read = file_size - offset;
+	if (length > 0 && length < to_read) to_read = length;
+	if (total_out) *total_out = to_read;
+
+	if (offset > 0) {
+		ret = fs_seek_retry(&f, offset, FS_SEEK_SET);
+		if (ret) {
+			LOG_ERR("read_file: seek %u: %d", offset, ret);
+			fs_close_retry(&f);
+			return ret;
+		}
+	}
+
+	static uint8_t buf[READ_CHUNK_BYTES];
+	uint32_t remaining = to_read;
+	int cb_ret = 0;
+	while (remaining > 0) {
+		uint32_t want = remaining < sizeof(buf) ? remaining : sizeof(buf);
+		ret = fs_read(&f, buf, want);
+		if (ret < 0) {
+			LOG_ERR("read_file: fs_read at %u left: %d", remaining, ret);
+			break;
+		}
+		if (ret == 0) break;   /* EOF earlier than expected */
+		cb_ret = cb(buf, (uint32_t)ret, user);
+		if (cb_ret < 0) {
+			LOG_WRN("read_file: cb returned %d → abort", cb_ret);
+			break;
+		}
+		remaining -= (uint32_t)ret;
+	}
+	fs_close_retry(&f);
+	LOG_INF("read_file: %s done, %u of %u byte streamed",
+		path, to_read - remaining, to_read);
+	return cb_ret < 0 ? cb_ret : ret < 0 ? ret : 0;
+}
+
 /* ---------- Consumer thread ---------- */
 static void writer_thread_fn(void *p1, void *p2, void *p3)
 {
@@ -590,6 +663,15 @@ static void writer_thread_fn(void *p1, void *p2, void *p3)
 						       &list_count);
 			atomic_clear(&list_req);
 			k_sem_give(&list_done);
+		}
+
+		/* #19.5: service streaming read_file requests in-thread. */
+		if (atomic_get(&read_req)) {
+			read_result = do_read_file(read_path, read_offset,
+						   read_length, read_cb,
+						   read_user, &read_total_size);
+			atomic_clear(&read_req);
+			k_sem_give(&read_done);
 		}
 
 		/* #19.3: service write_file requests in-thread (Set Name, etc.) */
@@ -691,6 +773,7 @@ int sd_writer_init(void)
 	k_sem_init(&touch_done,  0, 1);
 	k_sem_init(&write_done,  0, 1);
 	k_sem_init(&list_done,   0, 1);
+	k_sem_init(&read_done,   0, 1);
 
 	atomic_clear(&running);
 	atomic_clear(&stop_req);
@@ -699,6 +782,7 @@ int sd_writer_init(void)
 	atomic_clear(&touch_req);
 	atomic_clear(&write_req);
 	atomic_clear(&list_req);
+	atomic_clear(&read_req);
 
 	atomic_set(&thread_alive, 1);
 
@@ -881,6 +965,37 @@ int sd_writer_list_sessions(struct sd_writer_session_info *out,
 	}
 	*count_out = list_count;
 	return list_result;
+}
+
+int sd_writer_read_file(const char *path, uint32_t offset, uint32_t length,
+			sd_writer_read_cb cb, void *user, uint32_t *total_out)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	if (!path || !cb) return -EINVAL;
+
+	k_sem_reset(&read_done);
+
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	read_path        = path;     /* caller giữ alive trong scope của blocking call */
+	read_offset      = offset;
+	read_length      = length;
+	read_cb          = cb;
+	read_user        = user;
+	read_total_size  = 0;
+	k_mutex_unlock(&path_mtx);
+
+	read_result = -EBUSY;
+	atomic_set(&read_req, 1);
+
+	/* Streaming read có thể mất nhiều giây cho file 38 MB (~80 KB/s thực
+	 * tế ở MTU 247 / 7.5 ms). Cho timeout rộng — 10 phút. */
+	int sret = k_sem_take(&read_done, K_MINUTES(10));
+	if (sret) {
+		LOG_ERR("sd_writer_read_file: timeout");
+		return -ETIMEDOUT;
+	}
+	if (total_out) *total_out = read_total_size;
+	return read_result;
 }
 
 int sd_writer_touch_file(const char *path)

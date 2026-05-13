@@ -116,6 +116,41 @@ Bài học kỹ thuật quan trọng nhất của v1.0: `docs/POSTMORTEM_SD_WRIT
 - Tương đương với power-settle của `sdlog_init` ở #26 (đã làm cho SD), giờ làm cho phần còn lại.
 - Low priority — không gây production issue, chỉ là defensive coding.
 
+**#35 ⏳ Firmware silent halt on READ of crash-truncated audio.wav**
+
+Symptom: BLE READ trên `SESSION_NNNNN/audio.wav` của session bị crash
+giữa chừng (vd session 14 với audio.wav ~26 KB, folder created by rotate
+nhưng session aborted trước close) làm firmware **silent halt** sau khi
+`LOG_INF("READ submit ...")` fires. Không thấy `read_file: ... done` log,
+không có error log, BLE supervision timeout cuối cùng đẩy host disconnect,
+device không re-advertise. Phải power-cycle để recover.
+
+Reproduce: gắn PC sync CLI vào device sau crash, `python3 tools/sync.py
+--only-session 14 --only-file-idx 0`. RTT log dừng ngay sau `READ submit:
+sess=14 file=0 offset=0 length=0`.
+
+Hypothesis: FAT entry của audio.wav có `size` lớn hơn cluster chain
+allocation thực tế (rotate `fs_open` cấp size > 44 byte WAV header rồi
+session abort trước khi close finalizes). `fs_read` của sd_writer thread
+follow size đó đụng cluster trống → SDMMC driver hang chờ data nó không
+nên đọc.
+
+Workaround hiện tại: PC sync skip file_idx=0 cho session cuối (file
+chưa close gọn) — chấp nhận mất audio session bị crash. v1.0 đã có rule
+"empty session skip" tương tự ở #23.
+
+Fix proposal:
+- Trước fs_read trong `do_read_file`, kiểm tra `fs_stat` size vs cluster
+  validity. Khó implement vì FATFS không expose cluster chain validate API.
+- An toàn hơn: cap fs_read by `min(file_size, sane_bound)` với sane_bound
+  derived từ session lifetime. Nhưng không có lifetime info on disk.
+- Đơn giản nhất: nếu rotate left a placeholder open, `sd_writer_stop()`
+  finalize phải truncate to actual bytes_written rồi sync. Cần audit
+  rotate_full path để chắc chắn không có path leaves stale size.
+
+Low priority — không block v1.1 happy path. PC sync log ra `link dropped`
+clean khi gặp file này, user retry sau khi xóa session.
+
 **#34 ⏳ BLE GATT Sync — high-throughput READ via flow-control callback**
 
 Symptom: bleak READ trên file > ~50 KB hiện disconnect mid-stream. Lý
@@ -148,14 +183,11 @@ có thể chia file thành các chunk nhỏ hơn (offset + length) tạm thời.
 
 ## v1.1 — BLE sync (full spec in `docs/SYNC_PROTOCOL.md`)
 
-**#17 🟡 Session marker + persistent counter + free-space eviction** (v1.0 portion done; eviction = v1.1)
+**#17 ✅ Session marker + persistent counter + free-space eviction**
 - ✅ `.unsynced` 0-byte marker — implemented in #12; refined to integrity-signal in #23 (only created sau khi audio bytes > 0) và gated rotate-window trong #28.
-- ✅ Counter persistence `/SD/sync_state.json` — `load_counter` / `save_counter` / `scan_max_session_id` fallback (xem `session.c`); save chuyển trước `sd_writer_start` ở #32 để tránh contention.
+- ✅ Counter persistence `/SD/sync_state.json` — `load_counter` / `save_counter` / `scan_max_session_id` fallback; save chuyển trước `sd_writer_start` ở #32 để tránh contention.
 - ✅ ERROR-state entry path — FSM `APP_STATE_ERROR` đã có trong #14, SOS LED qua #13, watchdog catch trong session monitor.
-- ⏳ **Eviction (v1.1 only)** — phụ thuộc BLE sync để biết folder nào synced. Sẽ implement lúc làm #19/#21:
-  - Quét `/SD/SESSION_*`, phân loại synced (không có `.unsynced`) vs unsynced.
-  - Khi free < 100 MB và còn folder synced → xoá folder synced cũ nhất qua `sd_writer_remove_folder()` (API mới sẽ thêm sd_writer side, không gọi fs_unlink trực tiếp từ system_work_queue — invariant single-FATFS-owner của #32).
-  - Khi free < 100 MB và không còn folder synced → từ chối `session_start` → FSM `ERROR`.
+- ✅ **Eviction (v1.1)** — `sd_writer_get_free_mb` + `find_oldest_synced` + `remove_session_folder` (routes 5 unlinks through sd_writer thread). `session_start` chạy eviction loop: nếu free < 100 MB, xoá folder synced cũ nhất, loop tiếp tới free ≥ 100 MB hoặc hết folder synced (→ `SESSION_ERR_NO_SPACE` → FSM ERROR). Smoke verified: Device Info `sd_free_mb` field now returns real value from `fs_statvfs` via writer thread.
 
 **#18 ✅ Device name file + chip-id fallback**
 - Read `/SD/device.name` (max 32 bytes UTF-8) on boot. Strip newline.
@@ -292,11 +324,11 @@ Verify: build, flash, capture 90 s RTT around a tap-start. Two outcomes: (a) hea
 - v1.1.1 (planned, not in this task): add BLE Control opcodes `START_RECORD` / `STOP_RECORD` so PC tool can start/stop sessions. Requires BLE controller to stay on during RECORDING — spec change vs current SYNC_PROTOCOL.md, will be addressed when v1.1.1 kicks off.
 - **Status**: code changes landed on this branch; awaiting build + flash + RTT verify on PCB v1.0.
 
-**#21 ⏳ PC sync CLI (Python + bleak)**
-- Fill in `tools/sync.py` stubs: `cmd_list`, `cmd_read`, `cmd_ack`.
-- Atomic transfer: write to `<root>/<device_label>/SESSION_NNNNN.tmp/`, rename to `SESSION_NNNNN/` only when all three files present and ACK succeeded on device.
-- `--resume` mode: scan `.tmp/` directories, query device for current file size, resume `READ` from `offset`.
-- Logging: structured INFO output, suitable for parsing by the run_loop driver.
+**#21 ✅ PC sync CLI (Python + bleak)**
+- `tools/sync.py` implements LIST/READ/ACK/RESET + notify dispatcher + resumable per-file transfer + atomic `.tmp/` → final/ rename + ACK on success.
+- Debug flags: `--only-session`, `--only-file-idx`, `--max-bytes`, `--no-ack`, `--resume`.
+- Verified end-to-end against PCB v1.0: LIST 12 unsynced, READ meta.json (250 B) clean atomic rename, READ audio.wav `--max-bytes 1000` (1000/1000 B), grace-window fix handles BLE-driver reorder of last 40 B chunk.
+- Known firmware-side limits — separate tasks, not PC bugs: #34 (bulk READ disconnect >~50 KB), #35 (READ on corrupt audio.wav hangs firmware silently).
 
 ---
 

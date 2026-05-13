@@ -131,6 +131,13 @@ static uint32_t            stat_size_out;
 static struct k_sem        stat_done;
 static int                 stat_result;
 
+/* #17: fs_statvfs serviced from writer thread (keeps single-FATFS-owner
+ * invariant even khi session_start gọi nó song song với writer's idle loop). */
+static atomic_t            free_mb_req   = ATOMIC_INIT(0);
+static uint32_t            free_mb_out;
+static struct k_sem        free_mb_done;
+static int                 free_mb_result;
+
 static volatile uint32_t   audio_bytes;
 static volatile uint32_t   imu_samples;
 static volatile uint32_t   audio_dropped;
@@ -706,6 +713,21 @@ static void writer_thread_fn(void *p1, void *p2, void *p3)
 			k_sem_give(&stat_done);
 		}
 
+		/* #17: service free-space requests. */
+		if (atomic_get(&free_mb_req)) {
+			struct fs_statvfs vs;
+			int vret = fs_statvfs(SD_MOUNT_POINT, &vs);
+			if (vret == 0) {
+				uint64_t bytes = (uint64_t)vs.f_bsize * vs.f_bfree;
+				free_mb_out = (uint32_t)(bytes / (1024 * 1024));
+			} else {
+				free_mb_out = 0;
+			}
+			free_mb_result = vret;
+			atomic_clear(&free_mb_req);
+			k_sem_give(&free_mb_done);
+		}
+
 		/* #19.5: service streaming read_file requests in-thread. */
 		if (atomic_get(&read_req)) {
 			read_result = do_read_file(read_path, read_offset,
@@ -817,6 +839,7 @@ int sd_writer_init(void)
 	k_sem_init(&read_done,   0, 1);
 	k_sem_init(&unlink_done, 0, 1);
 	k_sem_init(&stat_done,   0, 1);
+	k_sem_init(&free_mb_done, 0, 1);
 
 	atomic_clear(&running);
 	atomic_clear(&stop_req);
@@ -828,6 +851,7 @@ int sd_writer_init(void)
 	atomic_clear(&read_req);
 	atomic_clear(&unlink_req);
 	atomic_clear(&stat_req);
+	atomic_clear(&free_mb_req);
 
 	atomic_set(&thread_alive, 1);
 
@@ -1055,6 +1079,19 @@ int sd_writer_unlink(const char *path)
 	atomic_set(&unlink_req, 1);
 	if (k_sem_take(&unlink_done, K_SECONDS(5))) return -ETIMEDOUT;
 	return unlink_result;
+}
+
+int sd_writer_get_free_mb(uint32_t *mb_out)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	if (!mb_out) return -EINVAL;
+	k_sem_reset(&free_mb_done);
+	free_mb_result = -EBUSY;
+	free_mb_out    = 0;
+	atomic_set(&free_mb_req, 1);
+	if (k_sem_take(&free_mb_done, K_SECONDS(5))) return -ETIMEDOUT;
+	*mb_out = free_mb_out;
+	return free_mb_result;
 }
 
 int sd_writer_stat(const char *path, uint8_t *type_out, uint32_t *size_out)

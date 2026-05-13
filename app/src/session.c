@@ -58,16 +58,56 @@ static uint32_t       unsynced_marker_id;   /* 0 = not yet set this session */
 static uint32_t       monitor_ticks;
 
 /* ---------- Helpers ---------- */
-static int statvfs_free_mb(uint32_t *mb_out)
+
+/* #17: scan sessions via sd_writer (holds single-FATFS-owner invariant);
+ * find lowest session_id whose `.unsynced` marker is absent (= PC has
+ * ACKed). Returns 0 if no synced folder available to evict. */
+static uint16_t find_oldest_synced(void)
 {
-	struct fs_statvfs s;
-	int ret = fs_statvfs(SD_MOUNT_POINT, &s);
-	if (ret) {
-		LOG_ERR("fs_statvfs: %d", ret);
-		return ret;
+	static struct sd_writer_session_info infos[SD_WRITER_LIST_MAX];
+	uint32_t count = 0;
+	int ret = sd_writer_list_sessions(infos, SD_WRITER_LIST_MAX, &count);
+	if (ret != 0) {
+		LOG_WRN("eviction: list_sessions: %d", ret);
+		return 0;
 	}
-	uint64_t bytes = (uint64_t)s.f_bsize * s.f_bfree;
-	*mb_out = (uint32_t)(bytes / (1024 * 1024));
+	uint16_t oldest = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		if (infos[i].is_unsynced) continue;
+		if (oldest == 0 || infos[i].session_id < oldest) {
+			oldest = infos[i].session_id;
+		}
+	}
+	return oldest;
+}
+
+/* #17: unlink known files in SESSION_NNNNN, then the folder itself.
+ * Routes every fs_unlink through sd_writer thread (single-FATFS-owner). */
+static int remove_session_folder(uint16_t sid)
+{
+	static const char *const files[] = {
+		".unsynced", "audio.wav", "imu.csv", "meta.json",
+	};
+	int io_err = 0;
+	for (size_t i = 0; i < ARRAY_SIZE(files); i++) {
+		char p[80];
+		snprintf(p, sizeof(p), "%s/" SESSION_PREFIX "%05u/%s",
+			 SD_MOUNT_POINT, (unsigned)sid, files[i]);
+		int r = sd_writer_unlink(p);
+		if (r != 0 && r != -ENOENT) {
+			LOG_WRN("evict: unlink %s: %d", p, r);
+			io_err = r;
+		}
+	}
+	char folder[80];
+	snprintf(folder, sizeof(folder), FOLDER_FMT, (unsigned)sid);
+	int fr = sd_writer_unlink(folder);
+	if (fr != 0 && fr != -ENOENT) {
+		LOG_ERR("evict: unlink folder %s: %d", folder, fr);
+		return fr;
+	}
+	if (io_err) return io_err;
+	LOG_INF("evict: removed SESSION_%05u", (unsigned)sid);
 	return 0;
 }
 
@@ -406,11 +446,33 @@ int session_start(int batt_mv)
 {
 	if (active) return -EALREADY;
 
+	/* #17: free-space + eviction loop.
+	 * - Query free via sd_writer (keeps single-FATFS-owner invariant).
+	 * - If below MIN_FREE_MB, try to evict the oldest synced folder. Loop
+	 *   until free ≥ MIN_FREE_MB OR no synced folder left.
+	 * - No synced folder + still below threshold → refuse, FSM goes ERROR.
+	 */
 	uint32_t free_mb = 0;
-	if (statvfs_free_mb(&free_mb) == 0 && free_mb < MIN_FREE_MB) {
-		LOG_ERR("session_start: only %u MB free, refusing (need eviction "
-			"or sync)", free_mb);
-		return SESSION_ERR_NO_SPACE;
+	int fret = sd_writer_get_free_mb(&free_mb);
+	if (fret == 0 && free_mb < MIN_FREE_MB) {
+		LOG_WRN("session_start: only %u MB free, trying eviction", free_mb);
+		while (free_mb < MIN_FREE_MB) {
+			uint16_t victim = find_oldest_synced();
+			if (victim == 0) {
+				LOG_ERR("session_start: %u MB free, no synced folder "
+					"to evict — sync required before record",
+					free_mb);
+				return SESSION_ERR_NO_SPACE;
+			}
+			int rret = remove_session_folder(victim);
+			if (rret != 0) {
+				LOG_ERR("session_start: evict SESSION_%05u failed: %d",
+					(unsigned)victim, rret);
+				return SESSION_ERR_NO_SPACE;
+			}
+			if (sd_writer_get_free_mb(&free_mb) != 0) break;
+		}
+		LOG_INF("session_start: eviction OK, now %u MB free", free_mb);
 	}
 
 	batt_at_start = batt_mv;

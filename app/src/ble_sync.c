@@ -221,15 +221,17 @@ static ssize_t info_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *att
 {
 	char body[256];
 	int batt_mv = battery_read_mv();
+	uint32_t free_mb = 0;
+	(void)sd_writer_get_free_mb(&free_mb);   /* #17: 0 if writer not init */
 	int n = snprintf(body, sizeof(body),
 		"{\"name\":\"%s\",\"chip_id\":\"%s\","
 		"\"fw\":\"%s+%s\",\"state\":\"%s\","
 		"\"batt_mv\":%d,"
-		"\"sd_total_mb\":0,\"sd_free_mb\":0,"
+		"\"sd_total_mb\":0,\"sd_free_mb\":%u,"
 		"\"unsynced\":0,\"synced\":0}",
 		identity_get_name(), identity_get_chip_id(),
 		FW_VERSION, FW_BUILD_HASH, app_state_lc(),
-		batt_mv);
+		batt_mv, free_mb);
 	if (n < 0 || n >= (int)sizeof(body)) {
 		LOG_ERR("Device Info JSON truncated: %d", n);
 		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);

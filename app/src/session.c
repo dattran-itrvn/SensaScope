@@ -423,15 +423,32 @@ int session_init(void)
 	k_work_init(&monitor_work, monitor_work_handler);
 	k_timer_init(&monitor_timer, monitor_timer_cb, NULL);
 
-	if (load_counter(&next_id) == 0) {
-		LOG_INF("counter loaded, next_id=%u", next_id);
-		return 0;
-	}
+	/* Counter file is the source of truth IF it's consistent with on-disk
+	 * folders. But rotation does NOT save_counter (#27 closure), so a crash
+	 * mid-session can leave sync_state.json behind the actual max folder id.
+	 * Take max(loaded, scan+1) so prepare_folder never hits -EEXIST.
+	 */
+	uint32_t loaded = 0;
+	bool have_file = (load_counter(&loaded) == 0);
 	uint32_t scanned = scan_max_session_id();
-	next_id = scanned + 1;
-	LOG_INF("counter rebuilt by scan, max=%u → next_id=%u",
-		scanned, next_id);
-	save_counter(next_id);
+	uint32_t scan_next = scanned + 1;
+
+	if (have_file && loaded >= scan_next) {
+		next_id = loaded;
+		LOG_INF("counter loaded, next_id=%u (scan max=%u)",
+			next_id, scanned);
+	} else {
+		next_id = scan_next;
+		if (have_file) {
+			LOG_WRN("counter file stale (%u), scan max=%u "
+				"→ corrected next_id=%u",
+				loaded, scanned, next_id);
+		} else {
+			LOG_INF("counter rebuilt by scan, max=%u → next_id=%u",
+				scanned, next_id);
+		}
+		save_counter(next_id);
+	}
 	return 0;
 }
 

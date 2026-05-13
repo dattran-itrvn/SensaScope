@@ -151,7 +151,7 @@ Bài học kỹ thuật quan trọng nhất của v1.0: `docs/POSTMORTEM_SD_WRIT
 - Refuse Control ops with status `0x01 busy` if device is `RECORDING`.
 - New module `ble_sync.c/h` plus tweaks to `prj.conf` for the BT macros.
 
-**#20 ⏳ State machine: IDLE / RECORDING / SYNC mutual exclusion**
+**#20 ✅ State machine: IDLE / RECORDING / SYNC mutual exclusion**
 - Update `STATE_*` enum to include `STATE_SYNC`.
 - Transitions:
   - `IDLE → RECORDING` via double-tap (existing).

@@ -77,6 +77,19 @@ static const char *state_name(app_state_t s)
 	return "?";
 }
 
+/* #19.2: lower-case state name cho Device Info JSON (theo SYNC_PROTOCOL.md). */
+const char *app_state_lc(void)
+{
+	switch (app_state) {
+	case APP_STATE_IDLE:             return "idle";
+	case APP_STATE_RECORDING:        return "recording";
+	case APP_STATE_LOW_BATT_HOLDOFF: return "low_batt";
+	case APP_STATE_SYNC:             return "sync";
+	case APP_STATE_ERROR:            return "error";
+	}
+	return "unknown";
+}
+
 /* Forward declarations for BLE radio control. */
 static void ble_adv_start(void);
 static void ble_adv_stop(void);

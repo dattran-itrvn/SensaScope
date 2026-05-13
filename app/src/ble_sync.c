@@ -12,9 +12,22 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/logging/log.h>
 
+#include <stdio.h>
+
 #include "ble_sync.h"
+#include "device_id.h"
+#include "battery.h"
 
 LOG_MODULE_REGISTER(ble_sync, LOG_LEVEL_INF);
+
+#ifndef FW_VERSION
+#define FW_VERSION "v1.0.0-dev"
+#endif
+#ifndef FW_BUILD_HASH
+#define FW_BUILD_HASH "unknown"
+#endif
+
+extern const char *app_state_lc(void);
 
 /* ---------- UUIDs ---------- */
 /* Base: 7e7e0001-3c4f-4b8e-8a8a-5e5e5e5e5e5e. Chỉ phần đầu 32 bit khác
@@ -45,17 +58,31 @@ static void data_ccc_cfg(const struct bt_gatt_attr *attr, uint16_t value)
 	LOG_INF("Data CCC = %u (subscribed=%d)", value, data_subscribed);
 }
 
-/* ---------- Handler stubs (will be filled by #19.2 - #19.6) ---------- */
+/* ---------- Device Info (read) — #19.2 ---------- */
+/* JSON theo SYNC_PROTOCOL.md. sd_total_mb / sd_free_mb / unsynced /
+ * synced sẽ wire khi làm #19.4 (LIST) — cần sd_writer API mới. Tạm dùng
+ * placeholder 0 trong #19.2.
+ */
 static ssize_t info_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			    void *buf, uint16_t len, uint16_t offset)
 {
-	ARG_UNUSED(conn);
-	ARG_UNUSED(attr);
-	ARG_UNUSED(buf);
-	ARG_UNUSED(len);
-	ARG_UNUSED(offset);
-	LOG_INF("Device Info read (stub — #19.2 will fill)");
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, "{}", 2);
+	char body[256];
+	int batt_mv = battery_read_mv();
+	int n = snprintf(body, sizeof(body),
+		"{\"name\":\"%s\",\"chip_id\":\"%s\","
+		"\"fw\":\"%s+%s\",\"state\":\"%s\","
+		"\"batt_mv\":%d,"
+		"\"sd_total_mb\":0,\"sd_free_mb\":0,"
+		"\"unsynced\":0,\"synced\":0}",
+		identity_get_name(), identity_get_chip_id(),
+		FW_VERSION, FW_BUILD_HASH, app_state_lc(),
+		batt_mv);
+	if (n < 0 || n >= (int)sizeof(body)) {
+		LOG_ERR("Device Info JSON truncated: %d", n);
+		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+	}
+	LOG_INF("Device Info read: %d B (offset=%u, len=%u)", n, offset, len);
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, body, n);
 }
 
 static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,

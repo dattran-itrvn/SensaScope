@@ -107,6 +107,25 @@ Bài học kỹ thuật quan trọng nhất của v1.0: `docs/POSTMORTEM_SD_WRIT
 
 ---
 
+## Hardening — open follow-ups (không block v1.0, không là v1.1 feature)
+
+**#31 ⏳ Boot timing margin — settle delay trước probe I²C/IMU**
+- Triệu chứng: thi thoảng IMU báo `WHO_AM_I = 0xFF` ở boot (đặc biệt sau flash, MCU reset nhưng LDO + LSM6DSL chưa POR xong). Hiện code tiếp tục OK do retry nội bộ ở chỗ khác, nhưng cảnh báo nhỏ trong RTT log không đẹp.
+- LSM6DSL datasheet: ~25 ms từ POR tới WHO_AM_I valid.
+- Fix proposal: thêm `k_msleep(100)` ngay đầu `main()` trước `led_init() / battery_init() / imu_init()`. Cost: 100 ms boot delay, không đáng kể.
+- Tương đương với power-settle của `sdlog_init` ở #26 (đã làm cho SD), giờ làm cho phần còn lại.
+- Low priority — không gây production issue, chỉ là defensive coding.
+
+**#33 ⏳ `sdlog_init` stuck-state recovery sau crash**
+- Triệu chứng: sau khi production crash (`-116` từ SD), thẻ vào trạng thái stuck — CMD0 cold-init fail repeatedly. `sdlog_init` hiện có 100 ms power-settle + 3 × 200 ms retry không đủ recover.
+- Cách giải tạm hiện tại: rút SD ra cắm lại (hard power-cycle slot).
+- End-user scenario: dùng pin với SW1, lần next boot là cold start với SD slot đã power-cycle theo MCU → không gặp stuck-state. Issue chỉ visible khi debug với J-Link cấp VTref liên tục.
+- Fix proposal: extend retry budget trong `sdlog_init` (10 × 500 ms = 5 s total), thêm explicit CMD0 ping với delay dài hơn (1-2 s) cho stuck card warm-up.
+- Phụ thuộc hardware: PCB v1.1+ có thể thêm hardware power-cycle line cho SD VCC (đã track trong `docs/PRODUCTION_TODO.md § Hardware`). Lúc đó firmware có thể GPIO toggle để hard-reset SD slot mà không cần user can thiệp.
+- Low priority cho v1.0 (production user dùng pin sẽ không gặp), nhưng cần cho QA bench testing.
+
+---
+
 ## v1.1 — BLE sync (full spec in `docs/SYNC_PROTOCOL.md`)
 
 **#17 🟡 Session marker + persistent counter + free-space eviction** (v1.0 portion done; eviction = v1.1)

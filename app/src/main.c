@@ -46,16 +46,21 @@ typedef enum {
 	APP_STATE_IDLE,
 	APP_STATE_RECORDING,
 	APP_STATE_LOW_BATT_HOLDOFF,
+	APP_STATE_SYNC,                  /* #20: BLE-connected, draining data */
 	APP_STATE_ERROR,
 } app_state_t;
 
 static app_state_t app_state = APP_STATE_IDLE;
+/* #20: state lúc trước khi vào SYNC — restore khi BLE disconnect. Cho phép
+ * `ERROR → SYNC → ERROR` (user vớt data từ thẻ SD đầy mà không clear lỗi). */
+static app_state_t pre_sync_state = APP_STATE_IDLE;
 static unsigned    batt_tick = 0;
 
 static const led_state_t state_to_led[] = {
 	[APP_STATE_IDLE]              = LED_STATE_IDLE,
 	[APP_STATE_RECORDING]         = LED_STATE_RECORDING,
 	[APP_STATE_LOW_BATT_HOLDOFF]  = LED_STATE_LOW_BATT,
+	[APP_STATE_SYNC]              = LED_STATE_SYNC,
 	[APP_STATE_ERROR]             = LED_STATE_ERROR,
 };
 
@@ -65,47 +70,133 @@ static const char *state_name(app_state_t s)
 	case APP_STATE_IDLE:             return "IDLE";
 	case APP_STATE_RECORDING:        return "RECORDING";
 	case APP_STATE_LOW_BATT_HOLDOFF: return "LOW_BATT_HOLDOFF";
+	case APP_STATE_SYNC:             return "SYNC";
 	case APP_STATE_ERROR:            return "ERROR";
 	}
 	return "?";
 }
 
+/* Forward declarations for BLE radio control. */
+static void ble_adv_start(void);
+static void ble_adv_stop(void);
+
 static void transition(app_state_t new_state)
 {
 	if (new_state == app_state) return;
 	LOG_INF("FSM: %s → %s", state_name(app_state), state_name(new_state));
+
+	/* #20: BLE radio control by state.
+	 * - RECORDING tắt advertising (giải phóng radio + tiết kiệm điện).
+	 * - Rời RECORDING → bật lại để PC có thể connect.
+	 * - SYNC giữ nguyên (đang trong connection, no advertising needed).
+	 */
+	if (app_state == APP_STATE_RECORDING && new_state != APP_STATE_RECORDING) {
+		ble_adv_start();
+	}
+	if (new_state == APP_STATE_RECORDING && app_state != APP_STATE_RECORDING) {
+		ble_adv_stop();
+	}
+
 	app_state = new_state;
 	led_set_state(state_to_led[new_state]);
 	batt_tick = 0;
 }
 
-/* ---------- BLE smoke advertise ---------- */
+/* ---------- BLE advertise + connect/disconnect FSM hook (#20) ---------- */
 static const struct bt_data adv_data[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
 		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
+static bool ble_advertising;
+
+static void ble_adv_start(void)
+{
+	if (ble_advertising) return;
+	int err = bt_le_adv_start(BT_LE_ADV_CONN, adv_data, ARRAY_SIZE(adv_data),
+				  NULL, 0);
+	if (err) {
+		LOG_ERR("bt_le_adv_start: %d", err);
+		return;
+	}
+	ble_advertising = true;
+	LOG_INF("BLE: advertising as '%s'", CONFIG_BT_DEVICE_NAME);
+}
+
+static void ble_adv_stop(void)
+{
+	if (!ble_advertising) return;
+	int err = bt_le_adv_stop();
+	if (err) LOG_WRN("bt_le_adv_stop: %d", err);
+	ble_advertising = false;
+	LOG_INF("BLE: advertising stopped");
+}
+
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
-	if (err) LOG_ERR("BLE connect failed: 0x%02x", err);
-	else     LOG_INF("BLE connected");
+	if (err) {
+		LOG_ERR("BLE connect failed: 0x%02x", err);
+		return;
+	}
+	LOG_INF("BLE connected (current FSM=%s)", state_name(app_state));
+
+	/* Connectable advertising auto-stops at the BLE controller side when a
+	 * connection completes. Reflect that in our local flag. */
+	ble_advertising = false;
+
+	/* #20: gate state-transition by current FSM.
+	 * - IDLE / LOW_BATT_HOLDOFF / ERROR → SYNC (allow draining data).
+	 * - RECORDING → reject (data integrity > convenience). With adv stop
+	 *   when entering RECORDING, this branch should be unreachable except
+	 *   for a race window; defense in depth.
+	 * - SYNC → impossible (no advertising while already in SYNC).
+	 */
+	switch (app_state) {
+	case APP_STATE_RECORDING:
+		LOG_WRN("BLE: reject connect (RECORDING); disconnecting");
+		bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		return;
+	case APP_STATE_SYNC:
+		LOG_WRN("BLE: unexpected connect while already in SYNC");
+		bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		return;
+	case APP_STATE_IDLE:
+	case APP_STATE_LOW_BATT_HOLDOFF:
+	case APP_STATE_ERROR:
+		pre_sync_state = app_state;
+		transition(APP_STATE_SYNC);
+		return;
+	}
 }
+
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	LOG_INF("BLE disconnected (reason 0x%02x)", reason);
+	ARG_UNUSED(conn);
+	LOG_INF("BLE disconnected (reason 0x%02x, FSM=%s)",
+		reason, state_name(app_state));
+
+	/* #20: rời SYNC → restore state trước SYNC. Trong các state khác
+	 * (e.g., disconnect xảy ra do reject ở on_connected), không transition.
+	 * Restart advertising (trừ khi đang RECORDING — advertising sẽ tự bật
+	 * lại lúc transition rời RECORDING). */
+	if (app_state == APP_STATE_SYNC) {
+		transition(pre_sync_state);
+	}
+	if (app_state != APP_STATE_RECORDING) {
+		ble_adv_start();
+	}
 }
+
 BT_CONN_CB_DEFINE(conn_cb) = {
 	.connected = on_connected,
 	.disconnected = on_disconnected,
 };
+
 static int start_ble(void)
 {
 	int err = bt_enable(NULL);
 	if (err) { LOG_ERR("bt_enable: %d", err); return err; }
-	err = bt_le_adv_start(BT_LE_ADV_CONN, adv_data, ARRAY_SIZE(adv_data),
-			      NULL, 0);
-	if (err) { LOG_ERR("bt_le_adv_start: %d", err); return err; }
-	LOG_INF("Advertising as '%s'", CONFIG_BT_DEVICE_NAME);
+	ble_adv_start();
 	return 0;
 }
 
@@ -115,6 +206,7 @@ static void on_double_tap(void)
 	switch (app_state) {
 	case APP_STATE_LOW_BATT_HOLDOFF:
 	case APP_STATE_ERROR:
+	case APP_STATE_SYNC:        /* #20: SYNC ↔ RECORDING bị cấm */
 		LOG_INF("tap ignored in %s", state_name(app_state));
 		return;
 
@@ -243,6 +335,11 @@ int main(void)
 					transition(APP_STATE_IDLE);
 				}
 			}
+			break;
+
+		case APP_STATE_SYNC:
+			/* #20: passive — wait for BLE disconnect callback to
+			 * restore pre_sync_state. No polling needed. */
 			break;
 
 		case APP_STATE_ERROR:

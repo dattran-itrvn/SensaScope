@@ -8,6 +8,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/logging/log.h>
@@ -48,11 +49,32 @@ static bool ctrl_subscribed;
 static bool data_subscribed;
 static struct bt_conn *current_conn;          /* refcounted; cleared on disconnect */
 
+/* #19.7: negotiate high-throughput link parameters after connect.
+ * Peripheral chỉ request PHY + data-len + conn-interval. MTU exchange
+ * thường do host (PC) initiate; Zephyr peripheral phản hồi với min(247,
+ * host_max). bt_gatt_exchange_mtu (client-initiated) cần BT_GATT_CLIENT
+ * config nên bỏ qua. */
+static void negotiate_link(struct bt_conn *conn)
+{
+	int ret = bt_conn_le_phy_update(conn, BT_CONN_LE_PHY_PARAM_2M);
+	if (ret) LOG_WRN("phy_update: %d", ret);
+
+	ret = bt_conn_le_data_len_update(conn, BT_LE_DATA_LEN_PARAM_MAX);
+	if (ret) LOG_WRN("data_len_update: %d", ret);
+
+	/* Connection interval: KHÔNG explicit request — macOS coerce trên
+	 * dynamic param_update + có thể disconnect connection nếu phía
+	 * peripheral push notify rate quá nhanh trong khi đang re-negotiate.
+	 * Host sẽ chọn interval của riêng nó. Throughput tuning ở task #34
+	 * (callback-based flow control) sẽ hiệu quả hơn là cố ép interval. */
+}
+
 static void track_connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) return;
 	if (current_conn) bt_conn_unref(current_conn);
 	current_conn = bt_conn_ref(conn);
+	negotiate_link(conn);
 }
 
 static void track_disconnected(struct bt_conn *conn, uint8_t reason)

@@ -106,3 +106,23 @@ uint32_t sd_writer_audio_bytes_written(void);
 uint32_t sd_writer_imu_samples_written(void);
 uint32_t sd_writer_audio_dropped(void);   /* PDM blocks dropped at producer */
 uint32_t sd_writer_imu_dropped(void);     /* IMU samples dropped at producer */
+
+/* #30: number of times do_rotate() returned an error and was deferred
+ * (caller kept writing to the old folder, retried on next timer tick).
+ * Monotonic since sd_writer_start. Useful diagnostic in monitor heartbeat.
+ */
+uint32_t sd_writer_rotate_deferred_total(void);
+
+/* #32: synchronously execute fs_open(CREATE|WRITE) + fs_close on `path`
+ * from the sd_writer thread. Used by session.c monitor để tạo `.unsynced`
+ * marker mà KHÔNG vi phạm "single-FATFS-owner" invariant của #25.
+ *
+ * Lý do tồn tại: trước #32, monitor_work_handler gọi fs_open/close trực
+ * tiếp từ system_work_queue trong khi sd_writer thread đang fs_write →
+ * SD card bị stress ngược và trả `-116 ETIME` sau ~12-41 phút. Đã
+ * reproduce trong Test 7 (xem `docs/POSTMORTEM_SD_WRITE_RELIABILITY.md`).
+ *
+ * Block trên semaphore tới khi writer thread xử lý xong; trả về 0 hoặc
+ * negative errno. Trả `-ENOENT` nếu writer chưa start.
+ */
+int sd_writer_touch_file(const char *path);

@@ -89,7 +89,7 @@
 		 * not bus speed. Empty-session bug is already fixed via #23
 		 * atomic-marker logic so the CRC noise is cosmetic.
 		 */
-		spi-max-frequency = <8000000>;  /* TEST: 8 MHz with batched writes — revisit before commit */
+		spi-max-frequency = <24000000>;
 
 		mmc {
 			compatible = "zephyr,sdmmc-disk";

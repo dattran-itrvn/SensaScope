@@ -182,6 +182,36 @@ Decision matrix (handled by `playbooks/sd_stress_isolation.md`):
 - Different signature from #23/#25/#27 (software races); `-116` is the SD-SPI driver's hard timeout. Card has likely hit wear / bad cells after many stress cycles.
 - FSM behavior is correct: watchdog catches the writer death, transitions to ERROR (LED SOS), partial session has its `.unsynced` marker → PC sync tool will still pull what was written.
 - Mitigations: vet new cards with 5 × 420 s stress before production use; consider logging `sdhc_spi` retry counter in `meta.json` as telemetry (separate task); rotate cards on warning.
+- **Superseded for firmware-side handling by #30** — `-116` at rotate boundary is now retry-and-defer instead of one-shot ERROR.
+
+**#32 ✅ SD write reliability — fix single-FATFS-owner violation**
+
+Production crash sau 12-41 phút mỗi session, signature `-116 ETIME` từ SDMMC. Các fix trước (#23/#25/#27/#30) đều không giải quyết. Sau khi bisect bằng 7 test cô lập (xem `docs/POSTMORTEM_SD_WRITE_RELIABILITY.md`), tìm ra root cause: `session.c` vi phạm "single-FATFS-owner" invariant của #25 — `monitor_work_handler.touch_unsynced` và `rotate_work_handler.statvfs_free_mb` gọi FATFS trực tiếp từ `system_work_queue` trong khi `sd_writer` thread đang fs_write → SD card stress → timeout `-116`.
+
+**Test 7 reproduce**: Test 5 (full data path, no FSM) + work-item gọi `fs_open + fs_close` 1Hz từ `system_work_queue` → CRASH sau 86 giây với đúng signature production. Test 5 (không có monitor mock) pass 55 phút clean.
+
+Fix (3 changes):
+- `sd_writer.c/h`: thêm `sd_writer_touch_file(path)` — synchronous, writer thread serve giữa drain (pattern `k_sem` giống `sd_writer_rotate_full` của #30).
+- `session.c monitor`: `touch_unsynced` route qua `sd_writer_touch_file` thay vì gọi `fs_open/close` trực tiếp.
+- `session.c rotate_work_handler`: xoá hoàn toàn `statvfs_free_mb()` (TODO khi làm #17 thì thêm API `sd_writer_get_free_mb`).
+- `session.c session_start`: đảo thứ tự — `save_counter()` chạy TRƯỚC `sd_writer_start()` (lúc đó writer chưa tồn tại, không contend).
+
+**Verify**: 1 giờ full production stack (auto-start, BLE on, default 10-phút rotation). Pass criterion: 0 FSM ERROR, 5+ rotation clean.
+
+**#30 🚧 SD write resilience — retry, verify, defer-on-rotate-fail**
+Triggered by 1-min-rotation stress test (2 runs, both failed at rotate boundary): the write path has two latent flaws that #25/#27/#28 didn't address.
+
+**Bug 1 — Silent FAT corruption**: in run 1, `fs_mkdir + fs_open + fs_write` for SESSION_00007 all returned success codes, but on disk the entry came out as a 0-byte regular file (no `DIR` attribute bit). 3.84 MB of audio became orphan clusters. Firmware logged no error.
+
+**Bug 2 — `-116` one-shot kill**: in both runs, a single `-116` SDMMC timeout at rotate boundary cascaded to `failed=1` → watchdog → FSM ERROR → user must reboot. SDMMC `-116` is typically a transient busy state (card doing internal GC/wear-levelling); higher-level retry with backoff would mask it, and FIFO slack (~1.6 s audio, ~2.5 s IMU) accommodates the delay.
+
+Fix in three layers, all in `sd_writer.c` (plus minor `session.c` adjustments):
+- **A. Post-mkdir / post-meta verify.** After `fs_mkdir(folder)`, `fs_stat` it and assert `type == FS_DIR_ENTRY_DIR`. After meta.json open+write+close, `fs_stat` meta_path and assert `size > 0`. If either check fails, log loud and return error from `do_rotate()`.
+- **B. Retry-with-backoff helpers** (`fs_open_retry`, `fs_write_retry`, `fs_close_retry`) wrapping FATFS calls in `do_rotate` and `drain_audio` / `drain_imu`. Catch `-EIO / -ENXIO / -ETIMEDOUT / -EAGAIN`, `k_msleep(200)`, retry up to 3 times.
+- **C. Defer-on-rotate-fail.** `do_rotate()` opens new audio+csv into `audio_file_pending` + `csv_file_pending` *before* closing old. On any failure (after retries): clean up partial new handles, **keep old handles active**, return error. Session keeps writing to the old folder; next rotate timer tick retries. After 3 consecutive rotate failures, escalate: set `failed=1` → FSM ERROR.
+- **Sync rotate API**: `sd_writer_rotate_full()` now blocks on a `k_sem` until the writer thread reports rotate result, so `session.c` knows whether to commit `current_id` / `next_id`.
+
+Verify: rerun 30-min stress at 1-min cadence on freshly-formatted 122 GB card. Pass criterion = 30 valid folders + no FSM → ERROR, OR < 3 deferred rotates (logged but recovered).
 - No firmware action; hardware-class. Track for visibility.
 
 [OBSOLETE — superseded by #25/#27 above; kept for history]

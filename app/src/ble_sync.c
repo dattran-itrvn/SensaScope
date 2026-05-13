@@ -258,13 +258,68 @@ static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 			ctrl_notify(reply, sizeof(reply));
 		}
 		return len;
-	case OP_ACK:
-	case OP_DEL:
-	case OP_RESET_CTL: {
-		/* Stubs cho #19.6 — trả lỗi ST_INVALID tạm thời. */
-		uint8_t reply[2] = { op, ST_INVALID };
+	case OP_ACK: {
+		if (len < 4) {
+			uint8_t reply[2] = { op, ST_INVALID };
+			ctrl_notify(reply, sizeof(reply));
+			return len;
+		}
+		uint16_t sid = p[2] | (p[3] << 8);
+		char path[80];
+		snprintf(path, sizeof(path), SD_MOUNT_POINT "/SESSION_%05u/.unsynced", sid);
+		int ret = sd_writer_unlink(path);
+		uint8_t st = (ret == 0) ? ST_OK :
+			     (ret == -ENOENT) ? ST_NOT_FOUND : ST_IO_ERR;
+		uint8_t reply[2] = { op, st };
 		ctrl_notify(reply, sizeof(reply));
-		LOG_WRN("opcode 0x%02x not implemented yet (#19.6)", op);
+		LOG_INF("ACK SESSION_%05u: ret=%d status=0x%02x", sid, ret, st);
+		return len;
+	}
+	case OP_DEL: {
+		if (len < 4) {
+			uint8_t reply[2] = { op, ST_INVALID };
+			ctrl_notify(reply, sizeof(reply));
+			return len;
+		}
+		uint16_t sid = p[2] | (p[3] << 8);
+		/* Spec: DEL refused if folder is "already synced" (no .unsynced
+		 * marker). DEL only deletes unsynced folders. */
+		char marker[80];
+		snprintf(marker, sizeof(marker), SD_MOUNT_POINT "/SESSION_%05u/.unsynced", sid);
+		uint8_t mtype = 0;
+		int sret = sd_writer_stat(marker, &mtype, NULL);
+		if (sret == -ENOENT) {
+			uint8_t reply[2] = { op, ST_ALREADY_SYNCED };
+			ctrl_notify(reply, sizeof(reply));
+			LOG_INF("DEL SESSION_%05u refused: no .unsynced marker", sid);
+			return len;
+		}
+		/* Unlink files then folder. */
+		static const char *const files[] = { ".unsynced", "audio.wav",
+						     "imu.csv", "meta.json" };
+		bool any_io_err = false;
+		for (size_t i = 0; i < ARRAY_SIZE(files); i++) {
+			char p2[96];
+			snprintf(p2, sizeof(p2), SD_MOUNT_POINT "/SESSION_%05u/%s",
+				 sid, files[i]);
+			int r = sd_writer_unlink(p2);
+			if (r != 0 && r != -ENOENT) any_io_err = true;
+		}
+		char folder[80];
+		snprintf(folder, sizeof(folder), SD_MOUNT_POINT "/SESSION_%05u", sid);
+		int fr = sd_writer_unlink(folder);
+		if (fr != 0 && fr != -ENOENT) any_io_err = true;
+		uint8_t st = any_io_err ? ST_IO_ERR : ST_OK;
+		uint8_t reply[2] = { op, st };
+		ctrl_notify(reply, sizeof(reply));
+		LOG_INF("DEL SESSION_%05u: status=0x%02x", sid, st);
+		return len;
+	}
+	case OP_RESET_CTL: {
+		atomic_clear(&read_abort_flag);
+		uint8_t reply[2] = { op, ST_OK };
+		ctrl_notify(reply, sizeof(reply));
+		LOG_INF("RESET_CTL: state cleared");
 		return len;
 	}
 	default: {

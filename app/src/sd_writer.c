@@ -118,6 +118,19 @@ static uint32_t            read_total_size;   /* set by op, returned to caller *
 static struct k_sem        read_done;
 static int                 read_result;
 
+/* #19.6: unlink + stat APIs (single path, sync via sd_writer thread). */
+static atomic_t            unlink_req    = ATOMIC_INIT(0);
+static char                unlink_path_buf[80];
+static struct k_sem        unlink_done;
+static int                 unlink_result;
+
+static atomic_t            stat_req      = ATOMIC_INIT(0);
+static char                stat_path_buf[80];
+static uint8_t             stat_type_out;
+static uint32_t            stat_size_out;
+static struct k_sem        stat_done;
+static int                 stat_result;
+
 static volatile uint32_t   audio_bytes;
 static volatile uint32_t   imu_samples;
 static volatile uint32_t   audio_dropped;
@@ -665,6 +678,34 @@ static void writer_thread_fn(void *p1, void *p2, void *p3)
 			k_sem_give(&list_done);
 		}
 
+		/* #19.6: service unlink + stat requests. */
+		if (atomic_get(&unlink_req)) {
+			char path[sizeof(unlink_path_buf)];
+			k_mutex_lock(&path_mtx, K_FOREVER);
+			strncpy(path, unlink_path_buf, sizeof(path) - 1);
+			path[sizeof(path) - 1] = '\0';
+			k_mutex_unlock(&path_mtx);
+			unlink_result = fs_unlink(path);
+			atomic_clear(&unlink_req);
+			k_sem_give(&unlink_done);
+		}
+		if (atomic_get(&stat_req)) {
+			char path[sizeof(stat_path_buf)];
+			k_mutex_lock(&path_mtx, K_FOREVER);
+			strncpy(path, stat_path_buf, sizeof(path) - 1);
+			path[sizeof(path) - 1] = '\0';
+			k_mutex_unlock(&path_mtx);
+			struct fs_dirent ent;
+			int sret = fs_stat(path, &ent);
+			if (sret == 0) {
+				stat_type_out = (uint8_t)ent.type;
+				stat_size_out = (uint32_t)ent.size;
+			}
+			stat_result = sret;
+			atomic_clear(&stat_req);
+			k_sem_give(&stat_done);
+		}
+
 		/* #19.5: service streaming read_file requests in-thread. */
 		if (atomic_get(&read_req)) {
 			read_result = do_read_file(read_path, read_offset,
@@ -774,6 +815,8 @@ int sd_writer_init(void)
 	k_sem_init(&write_done,  0, 1);
 	k_sem_init(&list_done,   0, 1);
 	k_sem_init(&read_done,   0, 1);
+	k_sem_init(&unlink_done, 0, 1);
+	k_sem_init(&stat_done,   0, 1);
 
 	atomic_clear(&running);
 	atomic_clear(&stop_req);
@@ -783,6 +826,8 @@ int sd_writer_init(void)
 	atomic_clear(&write_req);
 	atomic_clear(&list_req);
 	atomic_clear(&read_req);
+	atomic_clear(&unlink_req);
+	atomic_clear(&stat_req);
 
 	atomic_set(&thread_alive, 1);
 
@@ -996,6 +1041,38 @@ int sd_writer_read_file(const char *path, uint32_t offset, uint32_t length,
 	}
 	if (total_out) *total_out = read_total_size;
 	return read_result;
+}
+
+int sd_writer_unlink(const char *path)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	k_sem_reset(&unlink_done);
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	strncpy(unlink_path_buf, path, sizeof(unlink_path_buf) - 1);
+	unlink_path_buf[sizeof(unlink_path_buf) - 1] = '\0';
+	k_mutex_unlock(&path_mtx);
+	unlink_result = -EBUSY;
+	atomic_set(&unlink_req, 1);
+	if (k_sem_take(&unlink_done, K_SECONDS(5))) return -ETIMEDOUT;
+	return unlink_result;
+}
+
+int sd_writer_stat(const char *path, uint8_t *type_out, uint32_t *size_out)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	k_sem_reset(&stat_done);
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	strncpy(stat_path_buf, path, sizeof(stat_path_buf) - 1);
+	stat_path_buf[sizeof(stat_path_buf) - 1] = '\0';
+	stat_type_out = 0;
+	stat_size_out = 0;
+	k_mutex_unlock(&path_mtx);
+	stat_result = -EBUSY;
+	atomic_set(&stat_req, 1);
+	if (k_sem_take(&stat_done, K_SECONDS(5))) return -ETIMEDOUT;
+	if (type_out) *type_out = stat_type_out;
+	if (size_out) *size_out = stat_size_out;
+	return stat_result;
 }
 
 int sd_writer_touch_file(const char *path)

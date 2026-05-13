@@ -172,3 +172,14 @@ typedef int (*sd_writer_read_cb)(const uint8_t *chunk, uint32_t len, void *user)
 int sd_writer_read_file(const char *path, uint32_t offset, uint32_t length,
 			sd_writer_read_cb cb, void *user,
 			uint32_t *total_out);
+
+/* #19.6: fs_unlink trên `path` từ sd_writer thread. Dùng cho ACK (xoá
+ * .unsynced marker) và DEL (xoá file + folder). Trả `-ENOENT` nếu path
+ * không tồn tại HOẶC thread chưa init — caller phân biệt qua context.
+ */
+int sd_writer_unlink(const char *path);
+
+/* #19.6: kiểm tra path tồn tại + lấy entry type. type_out (nullable) trả
+ * FS_DIR_ENTRY_FILE hoặc FS_DIR_ENTRY_DIR. Trả `-ENOENT` nếu không tồn tại.
+ */
+int sd_writer_stat(const char *path, uint8_t *type_out, uint32_t *size_out);

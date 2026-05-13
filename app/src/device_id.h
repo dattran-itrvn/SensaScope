@@ -18,3 +18,9 @@
 int         identity_init(void);
 const char *identity_get_name(void);
 const char *identity_get_chip_id(void);
+
+/* #19.3: re-read /SD/device.name and update cached name. Called by
+ * ble_sync.c name_write_cb after Set Name persists the new value, so the
+ * change takes effect immediately (next meta.json + BLE Device Info read).
+ */
+int         identity_reload(void);

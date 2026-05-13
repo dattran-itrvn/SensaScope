@@ -17,6 +17,8 @@
 #include "ble_sync.h"
 #include "device_id.h"
 #include "battery.h"
+#include "sd_log.h"
+#include "sd_writer.h"
 
 LOG_MODULE_REGISTER(ble_sync, LOG_LEVEL_INF);
 
@@ -103,6 +105,10 @@ static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 	return len;
 }
 
+/* ---------- Set Name (write) — #19.3 ---------- */
+#define DEVICE_NAME_PATH    SD_MOUNT_POINT "/device.name"
+#define DEVICE_NAME_MAX     32
+
 static ssize_t name_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			     const void *buf, uint16_t len, uint16_t offset,
 			     uint8_t flags)
@@ -111,7 +117,19 @@ static ssize_t name_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 	ARG_UNUSED(attr);
 	ARG_UNUSED(offset);
 	ARG_UNUSED(flags);
-	LOG_INF("Set Name write: len=%u (stub — #19.3 will fill)", len);
+
+	if (len > DEVICE_NAME_MAX) {
+		LOG_WRN("Set Name: %u byte > %d limit", len, DEVICE_NAME_MAX);
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+
+	int ret = sd_writer_write_file(DEVICE_NAME_PATH, buf, len);
+	if (ret) {
+		LOG_ERR("Set Name: sd_writer_write_file: %d", ret);
+		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+	}
+	identity_reload();
+	LOG_INF("Set Name: persisted %u byte → '%s'", len, identity_get_name());
 	return len;
 }
 

@@ -82,3 +82,18 @@ int identity_init(void)
 
 const char *identity_get_name(void)    { return state.name; }
 const char *identity_get_chip_id(void) { return state.chip_id; }
+
+int identity_reload(void)
+{
+	char user_name[NAME_MAX_BYTES + 1];
+	if (read_device_name_file(user_name, sizeof(user_name)) == 0) {
+		strncpy(state.name, user_name, sizeof(state.name) - 1);
+		state.name[sizeof(state.name) - 1] = '\0';
+		LOG_INF("identity_reload: device.name='%s'", state.name);
+	} else {
+		snprintf(state.name, sizeof(state.name), "chip_%s", state.chip_id);
+		LOG_INF("identity_reload: device.name absent → fallback '%s'",
+			state.name);
+	}
+	return 0;
+}

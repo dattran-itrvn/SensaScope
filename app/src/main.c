@@ -286,6 +286,11 @@ int main(void)
 			LOG_INF("smoke ch0 (body, L)    peak=%d  mean=%d", pl, ml);
 			LOG_INF("smoke ch1 (ambient, R) peak=%d  mean=%d", pr, mr);
 		}
+		/* #19.3: bring up the writer thread now so BLE handlers can
+		 * route FATFS ops through it (Set Name, future LIST/READ/ACK/
+		 * DEL/etc.). Thread stays alive cho đến shutdown.
+		 */
+		sd_writer_init();
 		session_init();
 	}
 

@@ -34,12 +34,18 @@ struct sd_writer_imu_sample {
 	int16_t  gx, gy, gz;
 };
 
-/* ---------- Lifecycle (called from session.c) ---------- */
+/* ---------- Lifecycle ---------- */
 
-/* Open audio.wav (placeholder 44 B header) + imu.csv (CSV header), spawn
- * the consumer thread, then start audio + imu producer threads. Returns 0
- * on success, negative errno on failure (files not opened, threads not
- * spawned).
+/* #19.3: spawn the writer thread once at boot, AFTER sdlog_init. Thread
+ * remains alive for the rest of run-time, mediates FATFS ops via the
+ * sd_writer_touch_file / sd_writer_write_file APIs even khi không có
+ * session đang ghi. Gọi từ main.c trước khi start_ble() / session_init().
+ */
+int sd_writer_init(void);
+
+/* Open audio.wav (placeholder 44 B header) + imu.csv (CSV header), then
+ * start audio + imu producer threads. Writer thread phải đã chạy từ
+ * sd_writer_init(). Returns 0 on success, negative errno on failure.
  */
 int sd_writer_start(const char *audio_path, const char *csv_path);
 
@@ -126,3 +132,12 @@ uint32_t sd_writer_rotate_deferred_total(void);
  * negative errno. Trả `-ENOENT` nếu writer chưa start.
  */
 int sd_writer_touch_file(const char *path);
+
+/* #19.3: synchronously open(CREATE|WRITE|TRUNC) + write + close `path`
+ * với `body` (`len` byte) từ sd_writer thread. Dùng cho config file nhỏ
+ * (Set Name, future save_counter). len=0 → tạo file rỗng (truncate).
+ * KHÔNG cho bulk data — bulk ghi qua producer FIFO. Cùng pattern k_sem
+ * như sd_writer_touch_file. Trả `-ENOENT` nếu writer chưa start.
+ */
+#define SD_WRITER_MAX_SMALL_FILE_BYTES 64
+int sd_writer_write_file(const char *path, const void *body, size_t len);

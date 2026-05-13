@@ -34,12 +34,18 @@ struct sd_writer_imu_sample {
 	int16_t  gx, gy, gz;
 };
 
-/* ---------- Lifecycle (called from session.c) ---------- */
+/* ---------- Lifecycle ---------- */
 
-/* Open audio.wav (placeholder 44 B header) + imu.csv (CSV header), spawn
- * the consumer thread, then start audio + imu producer threads. Returns 0
- * on success, negative errno on failure (files not opened, threads not
- * spawned).
+/* #19.3: spawn the writer thread once at boot, AFTER sdlog_init. Thread
+ * remains alive for the rest of run-time, mediates FATFS ops via the
+ * sd_writer_touch_file / sd_writer_write_file APIs even khi không có
+ * session đang ghi. Gọi từ main.c trước khi start_ble() / session_init().
+ */
+int sd_writer_init(void);
+
+/* Open audio.wav (placeholder 44 B header) + imu.csv (CSV header), then
+ * start audio + imu producer threads. Writer thread phải đã chạy từ
+ * sd_writer_init(). Returns 0 on success, negative errno on failure.
  */
 int sd_writer_start(const char *audio_path, const char *csv_path);
 
@@ -126,3 +132,54 @@ uint32_t sd_writer_rotate_deferred_total(void);
  * negative errno. Trả `-ENOENT` nếu writer chưa start.
  */
 int sd_writer_touch_file(const char *path);
+
+/* #19.3: synchronously open(CREATE|WRITE|TRUNC) + write + close `path`
+ * với `body` (`len` byte) từ sd_writer thread. Dùng cho config file nhỏ
+ * (Set Name, future save_counter). len=0 → tạo file rỗng (truncate).
+ * KHÔNG cho bulk data — bulk ghi qua producer FIFO. Cùng pattern k_sem
+ * như sd_writer_touch_file. Trả `-ENOENT` nếu writer chưa start.
+ */
+#define SD_WRITER_MAX_SMALL_FILE_BYTES 64
+int sd_writer_write_file(const char *path, const void *body, size_t len);
+
+/* #19.4: list SESSION_NNNNN folders on SD. Scan từ sd_writer thread (giữ
+ * single-FATFS-owner). Caller cấp out array; thread fill `count_out` entry
+ * theo readdir order (typically ascending session id). Mỗi entry chứa
+ * id (1..65535), tổng bytes của audio.wav + imu.csv + meta.json, và flag
+ * is_unsynced (true = folder có `.unsynced` marker, chưa được PC ACK).
+ *
+ * Trả `-ENOENT` nếu thread chưa init. `max` ≤ SD_WRITER_LIST_MAX.
+ */
+#define SD_WRITER_LIST_MAX 40
+
+struct sd_writer_session_info {
+	uint16_t session_id;
+	uint32_t size_bytes;
+	bool     is_unsynced;
+};
+
+int sd_writer_list_sessions(struct sd_writer_session_info *out,
+			    uint32_t max, uint32_t *count_out);
+
+/* #19.5: streaming file read for BLE Data notify. Callback `cb` được gọi
+ * mỗi chunk từ sd_writer thread; ble_sync truyền cb thực hiện bt_gatt_notify.
+ * cb trả `< 0` để abort (vd ABORT opcode hoặc disconnect). `length=0` =
+ * đọc đến EOF. `total_out` (nullable) trả tổng số byte sẽ đọc trước khi
+ * stream bắt đầu. Trả `-ENOENT` nếu file không tồn tại hoặc thread chưa init.
+ */
+typedef int (*sd_writer_read_cb)(const uint8_t *chunk, uint32_t len, void *user);
+
+int sd_writer_read_file(const char *path, uint32_t offset, uint32_t length,
+			sd_writer_read_cb cb, void *user,
+			uint32_t *total_out);
+
+/* #19.6: fs_unlink trên `path` từ sd_writer thread. Dùng cho ACK (xoá
+ * .unsynced marker) và DEL (xoá file + folder). Trả `-ENOENT` nếu path
+ * không tồn tại HOẶC thread chưa init — caller phân biệt qua context.
+ */
+int sd_writer_unlink(const char *path);
+
+/* #19.6: kiểm tra path tồn tại + lấy entry type. type_out (nullable) trả
+ * FS_DIR_ENTRY_FILE hoặc FS_DIR_ENTRY_DIR. Trả `-ENOENT` nếu không tồn tại.
+ */
+int sd_writer_stat(const char *path, uint8_t *type_out, uint32_t *size_out);

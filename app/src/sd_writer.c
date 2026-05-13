@@ -4,8 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <stdlib.h>
+
 #include "audio.h"
 #include "imu_sampler.h"
+#include "sd_log.h"
 #include "sd_writer.h"
 
 LOG_MODULE_REGISTER(sd_writer, LOG_LEVEL_INF);
@@ -56,6 +59,14 @@ static struct fs_file_t    csv_file;
 static struct fs_file_t    audio_file_pending;
 static struct fs_file_t    csv_file_pending;
 
+/* #19.3 split semantics:
+ *   - thread_alive: writer thread spawned by sd_writer_init, runs cho đến
+ *     shutdown. Phục vụ touch_file/write_file ngay cả khi không có session.
+ *   - running: session active (audio.wav + imu.csv mở, producers chạy).
+ *     Cleared on sd_writer_stop, thread vẫn ở. Tên giữ nguyên để session.c
+ *     monitor backward-compat.
+ */
+static atomic_t            thread_alive  = ATOMIC_INIT(0);
 static atomic_t            running       = ATOMIC_INIT(0);
 static atomic_t            stop_req      = ATOMIC_INIT(0);
 static atomic_t            rotate_req    = ATOMIC_INIT(0);
@@ -79,6 +90,46 @@ static atomic_t            touch_req     = ATOMIC_INIT(0);
 static char                touch_path_buf[64];
 static struct k_sem        touch_done;
 static int                 touch_result;
+
+/* #19.3: synchronous write-file API (small config files only). */
+static atomic_t            write_req     = ATOMIC_INIT(0);
+static char                write_path_buf[64];
+static uint8_t             write_body_buf[SD_WRITER_MAX_SMALL_FILE_BYTES];
+static size_t              write_body_len;
+static struct k_sem        write_done;
+static int                 write_result;
+
+/* #19.4: synchronous list-sessions API. */
+static atomic_t            list_req      = ATOMIC_INIT(0);
+static struct sd_writer_session_info *list_out;
+static uint32_t            list_max;
+static uint32_t            list_count;
+static struct k_sem        list_done;
+static int                 list_result;
+
+/* #19.5: streaming read API — open file, loop chunks via callback, close. */
+static atomic_t            read_req      = ATOMIC_INIT(0);
+static const char         *read_path;
+static uint32_t            read_offset;
+static uint32_t            read_length;       /* 0 = to EOF */
+static sd_writer_read_cb   read_cb;
+static void               *read_user;
+static uint32_t            read_total_size;   /* set by op, returned to caller */
+static struct k_sem        read_done;
+static int                 read_result;
+
+/* #19.6: unlink + stat APIs (single path, sync via sd_writer thread). */
+static atomic_t            unlink_req    = ATOMIC_INIT(0);
+static char                unlink_path_buf[80];
+static struct k_sem        unlink_done;
+static int                 unlink_result;
+
+static atomic_t            stat_req      = ATOMIC_INIT(0);
+static char                stat_path_buf[80];
+static uint8_t             stat_type_out;
+static uint32_t            stat_size_out;
+static struct k_sem        stat_done;
+static int                 stat_result;
 
 static volatile uint32_t   audio_bytes;
 static volatile uint32_t   imu_samples;
@@ -443,18 +494,133 @@ static int do_rotate(void)
 	return 0;
 }
 
+/* ---------- #19.4 SD session enumeration (runs in writer thread) ---------- */
+static int do_list_sessions(struct sd_writer_session_info *out,
+			    uint32_t max, uint32_t *count_out)
+{
+	*count_out = 0;
+	struct fs_dir_t dir;
+	fs_dir_t_init(&dir);
+	int ret = fs_opendir(&dir, SD_MOUNT_POINT);
+	if (ret) {
+		LOG_ERR("list: opendir: %d", ret);
+		return ret;
+	}
+
+	static const char *const files[] = { "audio.wav", "imu.csv", "meta.json" };
+	const size_t prefix = sizeof("SESSION_") - 1;
+
+	while (*count_out < max) {
+		struct fs_dirent ent;
+		if (fs_readdir(&dir, &ent) || ent.name[0] == '\0') break;
+		if (ent.type != FS_DIR_ENTRY_DIR) continue;
+		if (strncmp(ent.name, "SESSION_", prefix) != 0) continue;
+		uint32_t id = strtoul(ent.name + prefix, NULL, 10);
+		if (id == 0 || id > UINT16_MAX) continue;
+
+		uint32_t total = 0;
+		for (size_t f = 0; f < ARRAY_SIZE(files); f++) {
+			char p[80];
+			snprintf(p, sizeof(p), "%s/%s/%s",
+				 SD_MOUNT_POINT, ent.name, files[f]);
+			struct fs_dirent s;
+			if (fs_stat(p, &s) == 0 && s.type == FS_DIR_ENTRY_FILE) {
+				total += (uint32_t)s.size;
+			}
+		}
+
+		char marker[80];
+		snprintf(marker, sizeof(marker), "%s/%s/.unsynced",
+			 SD_MOUNT_POINT, ent.name);
+		struct fs_dirent ms;
+		bool unsynced = (fs_stat(marker, &ms) == 0);
+
+		out[*count_out].session_id  = (uint16_t)id;
+		out[*count_out].size_bytes  = total;
+		out[*count_out].is_unsynced = unsynced;
+		(*count_out)++;
+	}
+	fs_closedir(&dir);
+	LOG_INF("list_sessions: %u entries scanned", *count_out);
+	return 0;
+}
+
+/* ---------- #19.5 streaming read (runs in writer thread) ---------- */
+#define READ_CHUNK_BYTES  240   /* fits MTU 247 notify (header 3 + payload) */
+
+static int do_read_file(const char *path, uint32_t offset, uint32_t length,
+			sd_writer_read_cb cb, void *user, uint32_t *total_out)
+{
+	struct fs_file_t f;
+	fs_file_t_init(&f);
+	int ret = fs_open_retry(&f, path, FS_O_READ);
+	if (ret) {
+		LOG_ERR("read_file: open %s: %d", path, ret);
+		if (total_out) *total_out = 0;
+		return ret;
+	}
+
+	struct fs_dirent s;
+	uint32_t file_size = 0;
+	if (fs_stat(path, &s) == 0) file_size = (uint32_t)s.size;
+
+	if (offset > file_size) {
+		fs_close_retry(&f);
+		if (total_out) *total_out = 0;
+		return -EINVAL;
+	}
+
+	uint32_t to_read = file_size - offset;
+	if (length > 0 && length < to_read) to_read = length;
+	if (total_out) *total_out = to_read;
+
+	if (offset > 0) {
+		ret = fs_seek_retry(&f, offset, FS_SEEK_SET);
+		if (ret) {
+			LOG_ERR("read_file: seek %u: %d", offset, ret);
+			fs_close_retry(&f);
+			return ret;
+		}
+	}
+
+	static uint8_t buf[READ_CHUNK_BYTES];
+	uint32_t remaining = to_read;
+	int cb_ret = 0;
+	while (remaining > 0) {
+		uint32_t want = remaining < sizeof(buf) ? remaining : sizeof(buf);
+		ret = fs_read(&f, buf, want);
+		if (ret < 0) {
+			LOG_ERR("read_file: fs_read at %u left: %d", remaining, ret);
+			break;
+		}
+		if (ret == 0) break;   /* EOF earlier than expected */
+		cb_ret = cb(buf, (uint32_t)ret, user);
+		if (cb_ret < 0) {
+			LOG_WRN("read_file: cb returned %d → abort", cb_ret);
+			break;
+		}
+		remaining -= (uint32_t)ret;
+	}
+	fs_close_retry(&f);
+	LOG_INF("read_file: %s done, %u of %u byte streamed",
+		path, to_read - remaining, to_read);
+	return cb_ret < 0 ? cb_ret : ret < 0 ? ret : 0;
+}
+
 /* ---------- Consumer thread ---------- */
 static void writer_thread_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-	LOG_INF("writer: started → %s + %s", audio_path_buf, csv_path_buf);
+	LOG_INF("writer: thread alive — waiting for session_start / fs ops");
 
 	int64_t last_sync = k_uptime_get();
 	uint32_t loop_ticks = 0;
 
-	while (!atomic_get(&stop_req)) {
-		if (atomic_get(&rotate_req)) {
+	while (atomic_get(&thread_alive)) {
+		bool session = atomic_get(&running) != 0;
+
+		if (session && atomic_get(&rotate_req)) {
 			int rr = do_rotate();
 			rotate_result = rr;
 			if (rr < 0) {
@@ -504,57 +670,183 @@ static void writer_thread_fn(void *p1, void *p2, void *p3)
 			k_sem_give(&touch_done);
 		}
 
-		uint32_t audio_chunk = 0;
-		int ret = drain_audio(&audio_chunk);
-		if (ret < 0) { atomic_set(&failed, 1); break; }
-
-		ret = drain_imu();
-		if (ret < 0) { atomic_set(&failed, 1); break; }
-
-		/* Periodic sync — only one thread, no contention possible. */
-		if (k_uptime_get() - last_sync >= SYNC_INTERVAL_MS) {
-			fs_sync(&audio_file);
-			fs_sync(&csv_file);
-			last_sync = k_uptime_get();
+		/* #19.4: service list_sessions requests in-thread. */
+		if (atomic_get(&list_req)) {
+			list_result = do_list_sessions(list_out, list_max,
+						       &list_count);
+			atomic_clear(&list_req);
+			k_sem_give(&list_done);
 		}
 
-		/* Heartbeat every 5 s for diagnostic. */
-		loop_ticks++;
-		if ((loop_ticks % (5000 / WRITER_TICK_MS)) == 0) {
-			LOG_INF("writer: audio=%u B, imu=%u samples, "
-				"dropped audio=%u imu=%u",
+		/* #19.6: service unlink + stat requests. */
+		if (atomic_get(&unlink_req)) {
+			char path[sizeof(unlink_path_buf)];
+			k_mutex_lock(&path_mtx, K_FOREVER);
+			strncpy(path, unlink_path_buf, sizeof(path) - 1);
+			path[sizeof(path) - 1] = '\0';
+			k_mutex_unlock(&path_mtx);
+			unlink_result = fs_unlink(path);
+			atomic_clear(&unlink_req);
+			k_sem_give(&unlink_done);
+		}
+		if (atomic_get(&stat_req)) {
+			char path[sizeof(stat_path_buf)];
+			k_mutex_lock(&path_mtx, K_FOREVER);
+			strncpy(path, stat_path_buf, sizeof(path) - 1);
+			path[sizeof(path) - 1] = '\0';
+			k_mutex_unlock(&path_mtx);
+			struct fs_dirent ent;
+			int sret = fs_stat(path, &ent);
+			if (sret == 0) {
+				stat_type_out = (uint8_t)ent.type;
+				stat_size_out = (uint32_t)ent.size;
+			}
+			stat_result = sret;
+			atomic_clear(&stat_req);
+			k_sem_give(&stat_done);
+		}
+
+		/* #19.5: service streaming read_file requests in-thread. */
+		if (atomic_get(&read_req)) {
+			read_result = do_read_file(read_path, read_offset,
+						   read_length, read_cb,
+						   read_user, &read_total_size);
+			atomic_clear(&read_req);
+			k_sem_give(&read_done);
+		}
+
+		/* #19.3: service write_file requests in-thread (Set Name, etc.) */
+		if (atomic_get(&write_req)) {
+			struct fs_file_t f;
+			char  path[sizeof(write_path_buf)];
+			uint8_t body[sizeof(write_body_buf)];
+			size_t blen;
+
+			k_mutex_lock(&path_mtx, K_FOREVER);
+			strncpy(path, write_path_buf, sizeof(path) - 1);
+			path[sizeof(path) - 1] = '\0';
+			blen = write_body_len;
+			if (blen > sizeof(body)) blen = sizeof(body);
+			memcpy(body, write_body_buf, blen);
+			k_mutex_unlock(&path_mtx);
+
+			int wret = fs_open_retry(&f, path,
+				FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
+			if (wret == 0) {
+				if (blen > 0) {
+					int n = fs_write_retry(&f, body, blen);
+					if (n < 0) wret = n;
+				}
+				int cret = fs_close_retry(&f);
+				if (wret == 0 && cret) wret = cret;
+			}
+			write_result = wret;
+			atomic_clear(&write_req);
+			k_sem_give(&write_done);
+		}
+
+		if (session) {
+			uint32_t audio_chunk = 0;
+			int ret = drain_audio(&audio_chunk);
+			if (ret < 0) {
+				atomic_set(&failed, 1);
+				atomic_clear(&running);
+				/* Don't kill thread — let it serve fs ops + future
+				 * sessions. session.c watchdog reads
+				 * sd_writer_failed() to detect this. */
+				continue;
+			}
+			ret = drain_imu();
+			if (ret < 0) {
+				atomic_set(&failed, 1);
+				atomic_clear(&running);
+				continue;
+			}
+
+			/* Periodic sync — only one thread, no contention. */
+			if (k_uptime_get() - last_sync >= SYNC_INTERVAL_MS) {
+				fs_sync(&audio_file);
+				fs_sync(&csv_file);
+				last_sync = k_uptime_get();
+			}
+
+			/* Heartbeat every 5 s for diagnostic. */
+			loop_ticks++;
+			if ((loop_ticks % (5000 / WRITER_TICK_MS)) == 0) {
+				LOG_INF("writer: audio=%u B, imu=%u samples, "
+					"dropped audio=%u imu=%u",
+					audio_bytes, imu_samples,
+					audio_dropped, imu_dropped);
+			}
+		}
+
+		/* stop_req from sd_writer_stop: finalize current session, clear
+		 * running, but keep thread alive for fs ops + next session. */
+		if (atomic_get(&stop_req)) {
+			uint32_t junk;
+			drain_audio(&junk);
+			drain_imu();
+			if (atomic_get(&running)) {
+				finalize_pair(audio_bytes);
+				atomic_clear(&running);
+			}
+			LOG_INF("writer: session stopped, %u B audio, %u IMU samples, "
+				"%u audio dropped, %u imu dropped",
 				audio_bytes, imu_samples,
 				audio_dropped, imu_dropped);
+			atomic_clear(&stop_req);
+			last_sync = k_uptime_get();
 		}
 
 		k_msleep(WRITER_TICK_MS);
 	}
 
-	/* Drain anything remaining post-stop. */
-	uint32_t junk;
-	drain_audio(&junk);
-	drain_imu();
-	finalize_pair(audio_bytes);
-
-	LOG_INF("writer: stopped, %u B audio, %u IMU samples, "
-		"%u audio dropped, %u imu dropped",
-		audio_bytes, imu_samples, audio_dropped, imu_dropped);
-	atomic_clear(&running);
+	LOG_INF("writer: thread exit");
 }
 
 /* ---------- Public API ---------- */
-int sd_writer_start(const char *audio_path, const char *csv_path)
+int sd_writer_init(void)
 {
-	if (atomic_get(&running)) return -EALREADY;
+	if (atomic_get(&thread_alive)) return -EALREADY;
 
 	k_mutex_init(&path_mtx);
 	k_sem_init(&rotate_done, 0, 1);
 	k_sem_init(&touch_done,  0, 1);
+	k_sem_init(&write_done,  0, 1);
+	k_sem_init(&list_done,   0, 1);
+	k_sem_init(&read_done,   0, 1);
+	k_sem_init(&unlink_done, 0, 1);
+	k_sem_init(&stat_done,   0, 1);
+
+	atomic_clear(&running);
+	atomic_clear(&stop_req);
+	atomic_clear(&rotate_req);
+	atomic_clear(&failed);
+	atomic_clear(&touch_req);
+	atomic_clear(&write_req);
+	atomic_clear(&list_req);
+	atomic_clear(&read_req);
+	atomic_clear(&unlink_req);
+	atomic_clear(&stat_req);
+
+	atomic_set(&thread_alive, 1);
+
+	k_tid_t tid = k_thread_create(&writer_thread, writer_stack,
+				      K_THREAD_STACK_SIZEOF(writer_stack),
+				      writer_thread_fn, NULL, NULL, NULL,
+				      WRITER_PRIO, 0, K_NO_WAIT);
+	k_thread_name_set(tid, "sd_writer");
+	return 0;
+}
+
+int sd_writer_start(const char *audio_path, const char *csv_path)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	if (atomic_get(&running)) return -EALREADY;
+
 	rotate_consecutive_fails = 0;
 	rotate_deferred_total    = 0;
 	rotate_result            = 0;
-	atomic_clear(&touch_req);
-	touch_result             = 0;
 	k_msgq_purge(&audio_msgq);
 	k_msgq_purge(&imu_msgq);
 
@@ -575,14 +867,7 @@ int sd_writer_start(const char *audio_path, const char *csv_path)
 	atomic_clear(&failed);
 	atomic_set(&running, 1);
 
-	k_tid_t tid = k_thread_create(&writer_thread, writer_stack,
-				      K_THREAD_STACK_SIZEOF(writer_stack),
-				      writer_thread_fn, NULL, NULL, NULL,
-				      WRITER_PRIO, 0, K_NO_WAIT);
-	k_thread_name_set(tid, "sd_writer");
-
-	/* Kick off producers AFTER files are open so the very first push has
-	 * somewhere to land. */
+	/* Kick off producers AFTER files are open + thread is told to drain. */
 	ret = audio_producer_start();
 	if (ret) {
 		LOG_ERR("audio_producer_start: %d", ret);
@@ -675,9 +960,124 @@ int sd_writer_push_imu(const struct sd_writer_imu_sample *sample)
 	return 0;
 }
 
+int sd_writer_write_file(const char *path, const void *body, size_t len)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	if (len > SD_WRITER_MAX_SMALL_FILE_BYTES) return -EMSGSIZE;
+
+	k_sem_reset(&write_done);
+
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	strncpy(write_path_buf, path, sizeof(write_path_buf) - 1);
+	write_path_buf[sizeof(write_path_buf) - 1] = '\0';
+	if (len > 0 && body) memcpy(write_body_buf, body, len);
+	write_body_len = len;
+	k_mutex_unlock(&path_mtx);
+
+	write_result = -EBUSY;
+	atomic_set(&write_req, 1);
+
+	int sret = k_sem_take(&write_done, K_SECONDS(5));
+	if (sret) {
+		LOG_ERR("sd_writer_write_file: timeout");
+		return -ETIMEDOUT;
+	}
+	return write_result;
+}
+
+int sd_writer_list_sessions(struct sd_writer_session_info *out,
+			    uint32_t max, uint32_t *count_out)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	if (!out || !count_out || max == 0) return -EINVAL;
+	if (max > SD_WRITER_LIST_MAX) max = SD_WRITER_LIST_MAX;
+
+	k_sem_reset(&list_done);
+
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	list_out   = out;
+	list_max   = max;
+	list_count = 0;
+	k_mutex_unlock(&path_mtx);
+
+	list_result = -EBUSY;
+	atomic_set(&list_req, 1);
+
+	int sret = k_sem_take(&list_done, K_SECONDS(10));
+	if (sret) {
+		LOG_ERR("sd_writer_list_sessions: timeout");
+		return -ETIMEDOUT;
+	}
+	*count_out = list_count;
+	return list_result;
+}
+
+int sd_writer_read_file(const char *path, uint32_t offset, uint32_t length,
+			sd_writer_read_cb cb, void *user, uint32_t *total_out)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	if (!path || !cb) return -EINVAL;
+
+	k_sem_reset(&read_done);
+
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	read_path        = path;     /* caller giữ alive trong scope của blocking call */
+	read_offset      = offset;
+	read_length      = length;
+	read_cb          = cb;
+	read_user        = user;
+	read_total_size  = 0;
+	k_mutex_unlock(&path_mtx);
+
+	read_result = -EBUSY;
+	atomic_set(&read_req, 1);
+
+	/* Streaming read có thể mất nhiều giây cho file 38 MB (~80 KB/s thực
+	 * tế ở MTU 247 / 7.5 ms). Cho timeout rộng — 10 phút. */
+	int sret = k_sem_take(&read_done, K_MINUTES(10));
+	if (sret) {
+		LOG_ERR("sd_writer_read_file: timeout");
+		return -ETIMEDOUT;
+	}
+	if (total_out) *total_out = read_total_size;
+	return read_result;
+}
+
+int sd_writer_unlink(const char *path)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	k_sem_reset(&unlink_done);
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	strncpy(unlink_path_buf, path, sizeof(unlink_path_buf) - 1);
+	unlink_path_buf[sizeof(unlink_path_buf) - 1] = '\0';
+	k_mutex_unlock(&path_mtx);
+	unlink_result = -EBUSY;
+	atomic_set(&unlink_req, 1);
+	if (k_sem_take(&unlink_done, K_SECONDS(5))) return -ETIMEDOUT;
+	return unlink_result;
+}
+
+int sd_writer_stat(const char *path, uint8_t *type_out, uint32_t *size_out)
+{
+	if (!atomic_get(&thread_alive)) return -ENOENT;
+	k_sem_reset(&stat_done);
+	k_mutex_lock(&path_mtx, K_FOREVER);
+	strncpy(stat_path_buf, path, sizeof(stat_path_buf) - 1);
+	stat_path_buf[sizeof(stat_path_buf) - 1] = '\0';
+	stat_type_out = 0;
+	stat_size_out = 0;
+	k_mutex_unlock(&path_mtx);
+	stat_result = -EBUSY;
+	atomic_set(&stat_req, 1);
+	if (k_sem_take(&stat_done, K_SECONDS(5))) return -ETIMEDOUT;
+	if (type_out) *type_out = stat_type_out;
+	if (size_out) *size_out = stat_size_out;
+	return stat_result;
+}
+
 int sd_writer_touch_file(const char *path)
 {
-	if (!atomic_get(&running)) return -ENOENT;
+	if (!atomic_get(&thread_alive)) return -ENOENT;
 
 	k_sem_reset(&touch_done);
 

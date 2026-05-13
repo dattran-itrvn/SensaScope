@@ -30,6 +30,7 @@
 #include "sd_log.h"
 #include "sd_writer.h"
 #include "session.h"
+#include "ble_sync.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -74,6 +75,19 @@ static const char *state_name(app_state_t s)
 	case APP_STATE_ERROR:            return "ERROR";
 	}
 	return "?";
+}
+
+/* #19.2: lower-case state name cho Device Info JSON (theo SYNC_PROTOCOL.md). */
+const char *app_state_lc(void)
+{
+	switch (app_state) {
+	case APP_STATE_IDLE:             return "idle";
+	case APP_STATE_RECORDING:        return "recording";
+	case APP_STATE_LOW_BATT_HOLDOFF: return "low_batt";
+	case APP_STATE_SYNC:             return "sync";
+	case APP_STATE_ERROR:            return "error";
+	}
+	return "unknown";
 }
 
 /* Forward declarations for BLE radio control. */
@@ -196,6 +210,7 @@ static int start_ble(void)
 {
 	int err = bt_enable(NULL);
 	if (err) { LOG_ERR("bt_enable: %d", err); return err; }
+	ble_sync_init();
 	ble_adv_start();
 	return 0;
 }
@@ -271,6 +286,11 @@ int main(void)
 			LOG_INF("smoke ch0 (body, L)    peak=%d  mean=%d", pl, ml);
 			LOG_INF("smoke ch1 (ambient, R) peak=%d  mean=%d", pr, mr);
 		}
+		/* #19.3: bring up the writer thread now so BLE handlers can
+		 * route FATFS ops through it (Set Name, future LIST/READ/ACK/
+		 * DEL/etc.). Thread stays alive cho đến shutdown.
+		 */
+		sd_writer_init();
 		session_init();
 	}
 

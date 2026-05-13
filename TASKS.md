@@ -116,6 +116,26 @@ Bài học kỹ thuật quan trọng nhất của v1.0: `docs/POSTMORTEM_SD_WRIT
 - Tương đương với power-settle của `sdlog_init` ở #26 (đã làm cho SD), giờ làm cho phần còn lại.
 - Low priority — không gây production issue, chỉ là defensive coding.
 
+**#34 ⏳ BLE GATT Sync — high-throughput READ via flow-control callback**
+
+Symptom: bleak READ trên file > ~50 KB hiện disconnect mid-stream. Lý
+do: `read_chunk_cb` đẩy `bt_gatt_notify` đều đặn, retry 20× × 5 ms khi
+`-ENOMEM`. TX buffer (10 ACL × 251 byte = ~2.5 KB queue) đầy nhanh,
+peripheral push faster than host consume → host eventually drop link.
+
+Fix proposal: dùng `bt_gatt_notify_cb` với completion callback. Mỗi
+chunk wait callback rồi mới push chunk kế. Đây là native flow control.
+- Cấp k_sem trong read_chunk_cb, give sau callback fires.
+- Throttle CHÍNH XÁC theo BLE TX rate (≈80 KB/s ở 7.5 ms interval).
+- Cũng giảm jitter — no retry loops.
+
+Tham chiếu: Zephyr `bt_gatt_notify_cb` example trong
+`samples/bluetooth/peripheral/` hoặc Nordic peripheral_uart.
+
+Small-file ops (Device Info, Set Name, meta.json, LIST, ACK, DEL) đã
+hoạt động ổn — fix này chỉ cần cho bulk READ. Low-pri vì PC sync flow
+có thể chia file thành các chunk nhỏ hơn (offset + length) tạm thời.
+
 **#33 ⏳ `sdlog_init` stuck-state recovery sau crash**
 - Triệu chứng: sau khi production crash (`-116` từ SD), thẻ vào trạng thái stuck — CMD0 cold-init fail repeatedly. `sdlog_init` hiện có 100 ms power-settle + 3 × 200 ms retry không đủ recover.
 - Cách giải tạm hiện tại: rút SD ra cắm lại (hard power-cycle slot).
@@ -144,7 +164,7 @@ Bài học kỹ thuật quan trọng nhất của v1.0: `docs/POSTMORTEM_SD_WRIT
 - BLE `Set Name` characteristic (write): persists to file, takes effect immediately. (Deferred to #19 along with the rest of the GATT.)
 - **Verified** end-to-end: scenario 1 (no file → fallback `chip_361e30a6dd726309`) via RTT log; scenario 2 (custom file `Dat-test`) by reading `meta.json` from a real session (`session_id=7`, `device_name="Dat-test"`) — confirms `identity_init()` reads SD and propagates the value into the session metadata.
 
-**#19 ⏳ BLE Sync Service GATT (firmware)**
+**#19 🟡 BLE Sync Service GATT (firmware)** — full opcode set OK, throughput tuning defer #34
 - Implement custom service per `docs/SYNC_PROTOCOL.md`. Service UUID `7e7e0001-3c4f-4b8e-8a8a-5e5e5e5e5e5e`.
 - Characteristics: Device Info (read JSON), Control (write+notify, opcodes `LIST/READ/ACK/ABORT/DEL/RESET`), Data (notify only, bulk file stream), Set Name (write).
 - On connect: negotiate PHY 2M + MTU 247 + connection interval 7.5 ms.

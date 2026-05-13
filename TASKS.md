@@ -181,6 +181,27 @@ có thể chia file thành các chunk nhỏ hơn (offset + length) tạm thời.
 
 ---
 
+## ✅ v1.1 CLOSED — 2026-05-13
+
+BLE sync happy path đầy đủ. Spec `docs/SYNC_PROTOCOL.md` đã implemented hai phía: device-side GATT (`ble_sync.c`) + PC-side CLI (`tools/sync.py`).
+
+Đã verify end-to-end với PCB v1.0 + bench Mac:
+- Scan → connect → IDLE→SYNC transition (#20, 3/3 bleak rounds)
+- Device Info JSON đúng (name, chip_id, fw build hash, state, batt_mv, sd_free_mb)
+- LIST 12 unsynced sessions
+- READ meta.json clean transfer + atomic `.tmp/` → final rename
+- READ audio.wav (capped `--max-bytes`) clean
+- ACK loop removes `.unsynced` markers
+- Eviction (#17): `sd_writer_get_free_mb` + `find_oldest_synced` + 5-unlink folder removal, all through writer thread (single-FATFS-owner invariant intact)
+
+Hardening còn lại — không block v1.1 happy path, defer như v1.0 đã defer #29/#33:
+- **#34** bulk READ > ~50 KB disconnects mid-stream (cần `bt_gatt_notify_cb` flow control). Workaround: PC tool chia chunk nhỏ qua `length` parameter; clean error reporting.
+- **#35** READ trên audio.wav của session crash-truncated làm firmware silent halt. Workaround: skip file_idx=0 cho session "current" tại thời điểm crash.
+
+Production users với pin-only operation (không J-Link debug) sẽ không gặp #29/#33; #34/#35 chỉ ảnh hưởng edge cases. v1.1 sẵn sàng cho field test với CHỈ MỘT giới hạn quan trọng: bulk audio.wav sync vẫn cần chia chunk thủ công.
+
+---
+
 ## v1.1 — BLE sync (full spec in `docs/SYNC_PROTOCOL.md`)
 
 **#17 ✅ Session marker + persistent counter + free-space eviction**

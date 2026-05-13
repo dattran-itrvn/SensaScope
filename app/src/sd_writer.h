@@ -183,3 +183,9 @@ int sd_writer_unlink(const char *path);
  * FS_DIR_ENTRY_FILE hoặc FS_DIR_ENTRY_DIR. Trả `-ENOENT` nếu không tồn tại.
  */
 int sd_writer_stat(const char *path, uint8_t *type_out, uint32_t *size_out);
+
+/* #17: fs_statvfs từ writer thread. Trả MB free trên SD volume. Block
+ * trên sem giống các API khác. Dùng thay cho fs_statvfs trực tiếp ở
+ * session.c để giữ single-FATFS-owner invariant.
+ */
+int sd_writer_get_free_mb(uint32_t *mb_out);

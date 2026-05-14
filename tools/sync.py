@@ -46,12 +46,14 @@ CHR_CONTROL      = "7e7e0003-3c4f-4b8e-8a8a-5e5e5e5e5e5e"
 CHR_DATA         = "7e7e0004-3c4f-4b8e-8a8a-5e5e5e5e5e5e"
 CHR_SET_NAME     = "7e7e0005-3c4f-4b8e-8a8a-5e5e5e5e5e5e"
 
-OP_LIST   = 0x01
-OP_READ   = 0x02
-OP_ACK    = 0x03
-OP_ABORT  = 0x04
-OP_DEL    = 0x05
-OP_RESET  = 0xFF
+OP_LIST          = 0x01
+OP_READ          = 0x02
+OP_ACK           = 0x03
+OP_ABORT         = 0x04
+OP_DEL           = 0x05
+OP_START_RECORD  = 0x06  # v1.1.1
+OP_STOP_RECORD   = 0x07  # v1.1.1
+OP_RESET         = 0xFF
 
 ST_OK             = 0x00
 ST_BUSY           = 0x01
@@ -244,6 +246,23 @@ class SyncSession:
         if reply[1] != ST_OK:
             raise RuntimeError(
                 f"ACK sess={sid} failed: status={STATUS_NAMES.get(reply[1], reply[1])}")
+
+    async def cmd_start_record(self) -> None:
+        """v1.1.1 — start a recording session over BLE. Must be in SYNC state."""
+        await self._raw_write(bytes([OP_START_RECORD, 0]))
+        reply = await self._await_ctrl(OP_START_RECORD, timeout=5.0)
+        if reply[1] != ST_OK:
+            raise RuntimeError(
+                f"START_RECORD failed: status={STATUS_NAMES.get(reply[1], reply[1])}")
+
+    async def cmd_stop_record(self) -> None:
+        """v1.1.1 — stop a BLE-initiated recording. Tap-initiated records
+        can only be stopped by the wearer; this returns BUSY for those."""
+        await self._raw_write(bytes([OP_STOP_RECORD, 0]))
+        reply = await self._await_ctrl(OP_STOP_RECORD, timeout=5.0)
+        if reply[1] != ST_OK:
+            raise RuntimeError(
+                f"STOP_RECORD failed: status={STATUS_NAMES.get(reply[1], reply[1])}")
 
 
 async def scan_for_devices(timeout: float = 5.0) -> list[tuple[str, str]]:

@@ -22,7 +22,7 @@ The device is always in exactly one of three states:
 - **RECORDING** — LED solid on. BLE off (controller paused). PDM + IMU + SD writers running. New session folder open with `.unsynced` marker.
 - **SYNC** — LED 2 Hz blink (preview pattern). PDM + IMU stopped. BLE connection active. PC tool drives transfers. Returns to IDLE on disconnect.
 
-`RECORDING ↔ SYNC` is forbidden. PC tool is rejected with error if device is RECORDING.
+`RECORDING ↔ SYNC` is forbidden when RECORDING was started by a local double-tap. **However v1.1.1 allows the inverse**: a PC tool in the SYNC state can issue `OP_START_RECORD` to begin recording while the BLE link stays connected. The connection persists through the recording so the PC can poll progress and issue `OP_STOP_RECORD` to end it. In this mode a double-tap is **ignored** ("start by X → stop by X" symmetry), and if the PC disconnects mid-record the device auto-stops the session.
 
 ## On-SD layout
 
@@ -115,6 +115,8 @@ Host writes `(OPCODE, 0, params)`. Device replies via notify with `(OPCODE, stat
 | `0x03` | ACK       | session_id (u16)                             | success/fail status              |
 | `0x04` | ABORT     | (no params)                                  | success — cancels in-flight READ |
 | `0x05` | DEL       | session_id (u16)                             | success/fail (refuse if not synced) |
+| `0x06` | START_RECORD | (no params)                               | success / busy. Only valid in SYNC state. |
+| `0x07` | STOP_RECORD  | (no params)                               | success / busy. Only stops a BLE-initiated session; tap-initiated sessions return BUSY. |
 | `0xFF` | RESET_CTL | (no params)                                  | clears any partial state         |
 
 `file_index`: 0=audio.wav, 1=imu.csv, 2=meta.json. (Order is well-known so host doesn't need to discover it.)

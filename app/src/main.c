@@ -52,6 +52,11 @@ typedef enum {
 } app_state_t;
 
 static app_state_t app_state = APP_STATE_IDLE;
+
+/* v1.1.1: track who started the current recording so we can enforce
+ * "start by X → stop by X" symmetry. true = PC tool via BLE OP_START_RECORD;
+ * false = local double-tap. Reset to false on session_stop. */
+static bool recording_via_ble = false;
 /* #20: state lúc trước khi vào SYNC — restore khi BLE disconnect. Cho phép
  * `ERROR → SYNC → ERROR` (user vớt data từ thẻ SD đầy mà không clear lỗi). */
 static app_state_t pre_sync_state = APP_STATE_IDLE;
@@ -105,7 +110,10 @@ static void transition(app_state_t new_state)
 	 * - SYNC giữ nguyên (đang trong connection, no advertising needed).
 	 */
 	if (app_state == APP_STATE_RECORDING && new_state != APP_STATE_RECORDING) {
-		ble_adv_start();
+		/* v1.1.1: skip adv_start when leaving RECORDING into SYNC — we
+		 * stayed connected during BLE-controlled record, no need (and
+		 * not desirable) to start a second advertiser. */
+		if (new_state != APP_STATE_SYNC) ble_adv_start();
 	}
 	if (new_state == APP_STATE_RECORDING && app_state != APP_STATE_RECORDING) {
 		ble_adv_stop();
@@ -193,7 +201,16 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 	 * (e.g., disconnect xảy ra do reject ở on_connected), không transition.
 	 * Restart advertising (trừ khi đang RECORDING — advertising sẽ tự bật
 	 * lại lúc transition rời RECORDING). */
-	if (app_state == APP_STATE_SYNC) {
+	/* v1.1.1: if PC disconnected mid-BLE-record, auto-stop the session.
+	 * Symmetric to "start by BLE → stop by BLE"; PC vanishing is the
+	 * implicit stop. Tap-initiated records are unaffected (BLE can't
+	 * be connected during those anyway). */
+	if (app_state == APP_STATE_RECORDING && recording_via_ble) {
+		LOG_WRN("BLE disconnected mid-record — auto-stopping session");
+		session_stop();
+		recording_via_ble = false;
+		transition(APP_STATE_IDLE);
+	} else if (app_state == APP_STATE_SYNC) {
 		transition(pre_sync_state);
 	}
 	if (app_state != APP_STATE_RECORDING) {
@@ -216,6 +233,56 @@ static int start_ble(void)
 }
 
 /* ---------- Double-tap callback (system work-queue context) ---------- */
+/* v1.1.1: BLE START_RECORD opcode handler. Called from ble_sync via a
+ * k_work item (system_work_queue) so FATFS access is safe. Mirrors the
+ * IDLE→RECORDING leg of on_double_tap but only valid in SYNC state.
+ * Returns 0 on success, -EBUSY for wrong state, -ENOSPC for SD full,
+ * -EAGAIN for low battery. */
+int app_request_start_record_via_ble(void)
+{
+	if (app_state != APP_STATE_SYNC) {
+		LOG_WRN("START_RECORD refused — state=%s", state_name(app_state));
+		return -EBUSY;
+	}
+	int batt_mv = battery_read_mv();
+	if (batt_mv >= 0 && batt_mv < BATT_LOW_MV) {
+		LOG_WRN("START_RECORD refused — batt %d mV < %d",
+			batt_mv, BATT_LOW_MV);
+		return -EAGAIN;
+	}
+	LOG_INF(">>> BLE START_RECORD — starting session");
+	int ret = session_start(batt_mv);
+	if (ret == SESSION_ERR_NO_SPACE) {
+		LOG_ERR("session_start: SD full → ERROR");
+		transition(APP_STATE_ERROR);
+		return -ENOSPC;
+	}
+	if (ret) {
+		LOG_ERR("session_start: %d (staying in SYNC)", ret);
+		return ret;
+	}
+	recording_via_ble = true;
+	transition(APP_STATE_RECORDING);
+	return 0;
+}
+
+/* v1.1.1: BLE STOP_RECORD opcode handler. Only stops a session that
+ * was BLE-initiated; rejects if the current record is tap-initiated
+ * (or no session active). Returns 0 on success, -EBUSY otherwise. */
+int app_request_stop_record_via_ble(void)
+{
+	if (app_state != APP_STATE_RECORDING || !recording_via_ble) {
+		LOG_WRN("STOP_RECORD refused — state=%s via_ble=%d",
+			state_name(app_state), recording_via_ble);
+		return -EBUSY;
+	}
+	LOG_INF(">>> BLE STOP_RECORD — stopping session");
+	session_stop();
+	recording_via_ble = false;
+	transition(APP_STATE_SYNC);
+	return 0;
+}
+
 static void on_double_tap(void)
 {
 	switch (app_state) {
@@ -226,8 +293,17 @@ static void on_double_tap(void)
 		return;
 
 	case APP_STATE_RECORDING:
+		/* v1.1.1: enforce start-method = stop-method. A BLE-initiated
+		 * record (PC tool) must be stopped via OP_STOP_RECORD, not by
+		 * a stray tap from the wearer. */
+		if (recording_via_ble) {
+			LOG_INF("tap ignored — BLE-controlled session, "
+				"use OP_STOP_RECORD");
+			return;
+		}
 		LOG_INF(">>> DOUBLE TAP — stopping session");
 		session_stop();
+		recording_via_ble = false;
 		transition(APP_STATE_IDLE);
 		return;
 

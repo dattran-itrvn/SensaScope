@@ -34,6 +34,8 @@ LOG_MODULE_REGISTER(ble_sync, LOG_LEVEL_INF);
 #endif
 
 extern const char *app_state_lc(void);
+extern int app_request_start_record_via_ble(void);
+extern int app_request_stop_record_via_ble(void);
 
 /* ---------- UUIDs ---------- */
 /* Base: 7e7e0001-3c4f-4b8e-8a8a-5e5e5e5e5e5e. Chỉ phần đầu 32 bit khác
@@ -187,12 +189,14 @@ static void data_ccc_cfg(const struct bt_gatt_attr *attr, uint16_t value)
 }
 
 /* ---------- Opcode framing (per docs/SYNC_PROTOCOL.md) ---------- */
-#define OP_LIST       0x01
-#define OP_READ       0x02
-#define OP_ACK        0x03
-#define OP_ABORT      0x04
-#define OP_DEL        0x05
-#define OP_RESET_CTL  0xFF
+#define OP_LIST          0x01
+#define OP_READ          0x02
+#define OP_ACK           0x03
+#define OP_ABORT         0x04
+#define OP_DEL           0x05
+#define OP_START_RECORD  0x06  /* v1.1.1: PC starts a session over BLE */
+#define OP_STOP_RECORD   0x07  /* v1.1.1: PC stops the BLE-started session */
+#define OP_RESET_CTL     0xFF
 
 #define ST_OK             0x00
 #define ST_BUSY           0x01
@@ -431,6 +435,36 @@ static int data_notify(const uint8_t *frame, size_t len)
 	return 0;
 }
 
+/* ---------- v1.1.1: BLE-driven record control ---------- */
+static struct k_work    record_start_work;
+static struct k_work    record_stop_work;
+static struct k_sem     record_done;
+static int              record_result;
+
+static void record_start_handler(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	record_result = app_request_start_record_via_ble();
+	k_sem_give(&record_done);
+}
+
+static void record_stop_handler(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	record_result = app_request_stop_record_via_ble();
+	k_sem_give(&record_done);
+}
+
+/* Map FSM return → wire status code per docs/SYNC_PROTOCOL.md. */
+static uint8_t record_status(int ret)
+{
+	if (ret == 0)        return ST_OK;
+	if (ret == -ENOSPC)  return ST_IO_ERR;
+	if (ret == -EBUSY)   return ST_BUSY;
+	if (ret == -EAGAIN)  return ST_BUSY;          /* low batt */
+	return ST_IO_ERR;
+}
+
 /* ---------- LIST handler — #19.4 (deferred to k_work) ---------- */
 static struct k_work list_work;
 
@@ -620,6 +654,31 @@ static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 		LOG_INF("DEL SESSION_%05u: status=0x%02x", sid, st);
 		return len;
 	}
+	case OP_START_RECORD: {
+		/* Dispatch FSM transition to system_work_queue so FATFS access
+		 * doesn't block the BT thread. Wait up to 3 s — session_start
+		 * does fs_mkdir + 3 × fs_open which is fast on healthy SD. */
+		k_sem_reset(&record_done);
+		record_result = -EINVAL;
+		k_work_submit(&record_start_work);
+		k_sem_take(&record_done, K_SECONDS(3));
+		uint8_t st = record_status(record_result);
+		uint8_t reply[2] = { op, st };
+		ctrl_notify(reply, sizeof(reply));
+		LOG_INF("START_RECORD: ret=%d status=0x%02x", record_result, st);
+		return len;
+	}
+	case OP_STOP_RECORD: {
+		k_sem_reset(&record_done);
+		record_result = -EINVAL;
+		k_work_submit(&record_stop_work);
+		k_sem_take(&record_done, K_SECONDS(3));
+		uint8_t st = record_status(record_result);
+		uint8_t reply[2] = { op, st };
+		ctrl_notify(reply, sizeof(reply));
+		LOG_INF("STOP_RECORD: ret=%d status=0x%02x", record_result, st);
+		return len;
+	}
 	case OP_RESET_CTL: {
 		atomic_clear(&read_abort_flag);
 		uint8_t reply[2] = { op, ST_OK };
@@ -795,6 +854,9 @@ int ble_sync_init(void)
 {
 	k_work_init(&list_work, list_work_handler);
 	k_work_init(&read_work, read_work_handler);
+	k_work_init(&record_start_work, record_start_handler);
+	k_work_init(&record_stop_work,  record_stop_handler);
+	k_sem_init(&record_done, 0, 1);
 	data_notify_init_once();
 
 	int lret = bt_l2cap_server_register(&sp_l2cap_server);

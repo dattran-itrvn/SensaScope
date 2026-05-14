@@ -116,7 +116,9 @@ Bài học kỹ thuật quan trọng nhất của v1.0: `docs/POSTMORTEM_SD_WRIT
 - Tương đương với power-settle của `sdlog_init` ở #26 (đã làm cho SD), giờ làm cho phần còn lại.
 - Low priority — không gây production issue, chỉ là defensive coding.
 
-**#35 ⏳ Firmware silent halt on READ of crash-truncated audio.wav**
+**#35 ✅ Firmware silent halt on READ of crash-truncated audio.wav** (2026-05-14)
+
+Same root cause as #34. The "silent halt" was not corrupt FAT — it was the retry-on-ENOMEM loop hammering the BT stack after the TX pool exhausted and bt_gatt_notify started silently dropping. With #34's serial credit-based flow control, the firmware no longer enters that state. Verified: SESSION_00014/audio.wav (25644 byte, the original repro case) syncs cleanly in 3.8 s; device stays up post-transfer.
 
 Symptom: BLE READ trên `SESSION_NNNNN/audio.wav` của session bị crash
 giữa chừng (vd session 14 với audio.wav ~26 KB, folder created by rotate
@@ -189,11 +191,12 @@ BLE sync happy path đầy đủ. Spec `docs/SYNC_PROTOCOL.md` đã implemented 
 - ACK loop removes `.unsynced` markers
 - Eviction (#17): `sd_writer_get_free_mb` + `find_oldest_synced` + 5-unlink folder removal, all through writer thread (single-FATFS-owner invariant intact)
 
-Hardening còn lại — không block v1.1 happy path, defer như v1.0 đã defer #29/#33:
-- **#34** bulk READ > ~50 KB disconnects mid-stream (cần `bt_gatt_notify_cb` flow control). Workaround: PC tool chia chunk nhỏ qua `length` parameter; clean error reporting.
-- **#35** READ trên audio.wav của session crash-truncated làm firmware silent halt. Workaround: skip file_idx=0 cho session "current" tại thời điểm crash.
+Update 2026-05-14: **#34 + #35 đã được fix** (commit `9b5fc1b`). Bulk READ giờ hoạt động end-to-end với serial credit-based flow control + dedicated work queue. Verified bench: imu.csv 170 KB sync clean (5.3 KB/s), audio.wav session 14 (file đã từng làm firmware hang) syncs clean trong 3.8 s. Throughput ceiling ~5 KB/s; 38 MB audio.wav full = ~2 giờ — chấp nhận được cho v1.1 với multi-credit optimization là follow-up nếu cần.
 
-Production users với pin-only operation (không J-Link debug) sẽ không gặp #29/#33; #34/#35 chỉ ảnh hưởng edge cases. v1.1 sẵn sàng cho field test với CHỈ MỘT giới hạn quan trọng: bulk audio.wav sync vẫn cần chia chunk thủ công.
+Hardening còn lại — không block v1.1, defer như v1.0 đã defer #29/#33:
+- (Không còn open limits sau khi #34/#35 đóng.) Hardware-class follow-ups #29/#31/#33 stay open as before.
+
+Production v1.1 firmware sẵn sàng cho field test full flow.
 
 ---
 

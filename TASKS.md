@@ -151,25 +151,20 @@ Fix proposal:
 Low priority — không block v1.1 happy path. PC sync log ra `link dropped`
 clean khi gặp file này, user retry sau khi xóa session.
 
-**#34 ⏳ BLE GATT Sync — high-throughput READ via flow-control callback**
+**#34 ✅ BLE GATT Sync — bulk READ deadlock fix** (2026-05-14)
 
-Symptom: bleak READ trên file > ~50 KB hiện disconnect mid-stream. Lý
-do: `read_chunk_cb` đẩy `bt_gatt_notify` đều đặn, retry 20× × 5 ms khi
-`-ENOMEM`. TX buffer (10 ACL × 251 byte = ~2.5 KB queue) đầy nhanh,
-peripheral push faster than host consume → host eventually drop link.
+Symptom (pre-fix): bleak READ > ~10 chunks (240 B each) → PC nhận 0 byte; threshold = `CONFIG_BT_BUF_ACL_TX_COUNT`. Originally diagnosed as throughput / disconnect; bisect revealed two separate bugs:
 
-Fix proposal: dùng `bt_gatt_notify_cb` với completion callback. Mỗi
-chunk wait callback rồi mới push chunk kế. Đây là native flow control.
-- Cấp k_sem trong read_chunk_cb, give sau callback fires.
-- Throttle CHÍNH XÁC theo BLE TX rate (≈80 KB/s ở 7.5 ms interval).
-- Cũng giảm jitter — no retry loops.
+1. **Silent drop khi pool exhaust**: `bt_gatt_notify` trả `ret=0` ngay cả khi ACL TX pool đầy, queue PDU vào nowhere → PC không nhận. Threshold chính xác = TX_COUNT (10→threshold 10, 32→threshold 32). Phải dùng `bt_gatt_notify_cb` với credit-based flow control để biết khi nào pool drained thực sự.
 
-Tham chiếu: Zephyr `bt_gatt_notify_cb` example trong
-`samples/bluetooth/peripheral/` hoặc Nordic peripheral_uart.
+2. **Deadlock via system_work_queue**: Callback từ `bt_gatt_notify_cb` dispatch trên `system_work_queue`. `read_work_handler` chạy trên cùng queue, block trên k_sem chờ callback → callback không bao giờ chạy → 3 s timeout → -EIO. Phải dispatch READ qua dedicated work queue (`read_wq` trong ble_sync.c) để tách context.
 
-Small-file ops (Device Info, Set Name, meta.json, LIST, ACK, DEL) đã
-hoạt động ổn — fix này chỉ cần cho bulk READ. Low-pri vì PC sync flow
-có thể chia file thành các chunk nhỏ hơn (offset + length) tạm thời.
+Fix combined trong commit này:
+- `app/src/ble_sync.c`: `data_notify` dùng `bt_gatt_notify_cb` với 1-permit semaphore; `on_data_notify_done` callback releases. Dedicated `read_wq` (k_work_queue) chạy READ độc lập system_work_queue.
+- `app/prj.conf`: `CONFIG_BT_BUF_ACL_TX_COUNT=32`, `CONFIG_BT_L2CAP_TX_BUF_COUNT=32`, `CONFIG_BT_GATT_NOTIFY_MULTIPLE=n`.
+- `app/boards/sensapulse_v1.overlay`: `spi-max-frequency` 24 → 16 MHz (driver thực sự đã round xuống 16 MHz, giờ config match reality).
+
+Verified bench: imu.csv 170 KB sync in 31.6 s (5.3 KB/s). Audio bulk transfer streaming clean qua chunk #1125 (270 KB) tested via RTT capture, nomem_total=0. Throughput ceiling ~5 KB/s từ serial 1-in-flight cb pattern; multi-credit version vẫn có thể tăng future, nhưng correctness first.
 
 **#33 ⏳ `sdlog_init` stuck-state recovery sau crash**
 - Triệu chứng: sau khi production crash (`-116` từ SD), thẻ vào trạng thái stuck — CMD0 cold-init fail repeatedly. `sdlog_init` hiện có 100 ms power-settle + 3 × 200 ms retry không đủ recover.

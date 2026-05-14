@@ -75,21 +75,26 @@
 		compatible = "zephyr,sdhc-spi-slot";
 		reg = <0>;
 		status = "okay";
-		/* 24 MHz is the ceiling FATFS reports as "under 25 MHz" via the
-		 * sdhc_spi driver. We get a few transient `sdhc_spi: Bad data
-		 * CRC` events per minute (5 in 90 s on the test bench) but the
-		 * SD-layer retry handles them and audio data lands intact.
+		/* nRF52840 SPIM3 supports only the discrete clocks 8/16/32 MHz
+		 * (HFCLK 32 MHz, integer dividers). Zephyr's nrfx_spim driver
+		 * rounds DOWN any requested frequency that isn't an exact match
+		 * (see `get_nrf_spim_frequency` in spi_nrfx_spim.c). Request 24M
+		 * → actual SPI clock is **16 MHz**, not 24 MHz. The FATFS log
+		 * line "Maximum SD clock is under 25MHz, using clock of
+		 * 24000000Hz" reports the SD layer's ceiling, not the wire rate.
 		 *
-		 * Tried 8 MHz to see if the CRCs disappear — they didn't (still
-		 * 7 in 90 s) AND the slower per-block fs_write made FATFS stalls
-		 * outlast the PDM mem-slab (~800 ms at 8 blocks), so the
-		 * recorder thread got `dmic_read: -EAGAIN` ("No room in RX queue")
-		 * and the watchdog tripped to ERROR. Lowering clock is the wrong
-		 * lever on this PCB; root cause is signal-integrity / card cells,
-		 * not bus speed. Empty-session bug is already fixed via #23
-		 * atomic-marker logic so the CRC noise is cosmetic.
+		 * Setting the request to 16 MHz here so the configuration value
+		 * matches the actual bus speed and nobody mis-reads it later.
+		 *
+		 * History: occasional `sdhc_spi: Bad data CRC` events show up at
+		 * this speed (a few per minute on the bench) — SD-layer retry
+		 * absorbs them. Tried 8 MHz earlier (pre-#25) and audio broke
+		 * because direct per-block fs_write stalled FATFS past the PDM
+		 * mem-slab window. After #25 batched sd_writer, 8 MHz is safe
+		 * too — keep 16 MHz unless we get fresh evidence the module
+		 * (Ebyte E73-2G4M08S1C) needs a slower bus.
 		 */
-		spi-max-frequency = <24000000>;
+		spi-max-frequency = <16000000>;
 
 		mmc {
 			compatible = "zephyr,sdmmc-disk";

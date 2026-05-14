@@ -49,6 +49,10 @@ static bool ctrl_subscribed;
 static bool data_subscribed;
 static struct bt_conn *current_conn;          /* refcounted; cleared on disconnect */
 
+/* #34: forward decl for data-notify credit (used by track_disconnected). */
+static struct k_sem data_notify_credit;
+static bool         data_notify_inited;
+
 /* #19.7: negotiate high-throughput link parameters after connect.
  * Peripheral chỉ request PHY + data-len + conn-interval. MTU exchange
  * thường do host (PC) initiate; Zephyr peripheral phản hồi với min(247,
@@ -83,6 +87,14 @@ static void track_disconnected(struct bt_conn *conn, uint8_t reason)
 	if (current_conn) {
 		bt_conn_unref(current_conn);
 		current_conn = NULL;
+	}
+	/* #34: force-release the data-notify credit in case the pending TX
+	 * callback never fires (e.g., abrupt link drop mid-stream). Without
+	 * this the next session's first notify would block 3 s waiting for
+	 * the ghost callback. */
+	if (data_notify_inited) {
+		k_sem_reset(&data_notify_credit);
+		k_sem_give(&data_notify_credit);
 	}
 }
 
@@ -152,20 +164,89 @@ static int ctrl_notify(const uint8_t *frame, size_t len)
 	return -EIO;
 }
 
+/* ---------- Data notify with serial flow control — #34 ---------- *
+ * Pre-fix bug: bt_gatt_notify() returned 0 even when ACL TX pool was
+ * exhausted, silently dropping the data. Bisect (2026-05-14) showed the
+ * cliff is exactly CONFIG_BT_BUF_ACL_TX_COUNT chunks: with TX_COUNT=10,
+ * 8-10 chunks deliver and the rest vanish; TX_COUNT=32 pushes cliff to
+ * ~31 chunks.
+ *
+ * Real fix: bt_gatt_notify_cb with a 1-permit semaphore. The completion
+ * callback runs when the controller has transmitted the PDU (slot in
+ * ACL TX pool freed), so we never overrun.
+ *
+ * Tradeoff: 1 in-flight ≈ 1 notify per BLE connection interval (7.5-15
+ * ms typical). At 240 B/chunk: 16-32 kB/s realistic — slow but correct.
+ * Multi-credit version is a follow-up; correctness first. */
+static struct bt_gatt_notify_params data_notify_params;
+static uint8_t                      data_notify_buf[244];
+
+static void data_notify_init_once(void)
+{
+	if (data_notify_inited) return;
+	k_sem_init(&data_notify_credit, 1, 1);
+	data_notify_inited = true;
+}
+
+static void on_data_notify_done(struct bt_conn *conn, void *user_data)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(user_data);
+	k_sem_give(&data_notify_credit);
+}
+
 static int data_notify(const uint8_t *frame, size_t len)
 {
 	if (!current_conn) return -ENOTCONN;
 	if (!data_subscribed) return -EACCES;
-	return bt_gatt_notify(current_conn,
-			      &ble_sync_svc.attrs[ATTR_DATA_VAL],
-			      frame, len);
+
+	/* 0-byte EOF terminator: send directly, no credit needed. */
+	if (len == 0) {
+		return bt_gatt_notify(current_conn,
+				      &ble_sync_svc.attrs[ATTR_DATA_VAL],
+				      frame, len);
+	}
+	if (len > sizeof(data_notify_buf)) return -EINVAL;
+
+	/* Block waiting for the previous chunk's controller-TX-complete
+	 * callback. 3 s ceiling — if the link is wedged, give up so the
+	 * caller can report -EIO and the host can recover. */
+	if (k_sem_take(&data_notify_credit, K_SECONDS(3))) {
+		LOG_ERR("data_notify: credit timeout (link wedged?)");
+		return -ETIMEDOUT;
+	}
+
+	memcpy(data_notify_buf, frame, len);
+	data_notify_params = (struct bt_gatt_notify_params){
+		.attr = &ble_sync_svc.attrs[ATTR_DATA_VAL],
+		.data = data_notify_buf,
+		.len  = len,
+		.func = on_data_notify_done,
+	};
+	int ret = bt_gatt_notify_cb(current_conn, &data_notify_params);
+	if (ret) {
+		k_sem_give(&data_notify_credit);
+		return ret;
+	}
+	return 0;
 }
 
 /* ---------- LIST handler — #19.4 (deferred to k_work) ---------- */
 static struct k_work list_work;
 
-/* READ state — #19.5 (declared early so ctrl_write_cb above can stash params). */
-static struct k_work read_work;
+/* #34: dedicated work queue for READ. system_work_queue is also where
+ * bt_gatt_notify_cb completion callbacks dispatch; if read_work_handler
+ * blocks on a callback-signaled semaphore while running on
+ * system_work_queue, the callback never gets to run → deadlock,
+ * data_notify_credit times out after 3 s. Dedicated queue breaks the
+ * cycle: read_work blocks on this queue's thread, callback runs on
+ * system_work_queue independently.
+ */
+#define READ_WQ_STACK_SZ   2048
+#define READ_WQ_PRIO       K_PRIO_PREEMPT(7)
+K_THREAD_STACK_DEFINE(read_wq_stack, READ_WQ_STACK_SZ);
+static struct k_work_q read_wq;
+static struct k_work   read_work;
 static uint16_t      read_session_id;
 static uint8_t       read_file_index;
 static uint32_t      read_offset_req;
@@ -273,7 +354,7 @@ static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 		LOG_INF("READ submit: sess=%u file=%u offset=%u length=%u",
 			read_session_id, read_file_index,
 			read_offset_req, read_length_req);
-		k_work_submit(&read_work);
+		k_work_submit_to_queue(&read_wq, &read_work);
 		return len;
 	case OP_ABORT:
 		atomic_set(&read_abort_flag, 1);
@@ -369,22 +450,30 @@ static const char *file_index_to_name(uint8_t idx)
 static int read_chunk_cb(const uint8_t *chunk, uint32_t len, void *user)
 {
 	ARG_UNUSED(user);
-	if (atomic_get(&read_abort_flag)) return -ECANCELED;
-	/* Retry với backoff khi ATT TX buffer hết. PC consumes notifies tại
-	 * BLE connection interval (~7.5-15 ms). Backoff 5 ms × 20 = 100 ms
-	 * total — đủ cho buffer drain ở host side mà không stall nhiều.
-	 * Bottleneck tổng thể vẫn ở connection-interval, không phải ở đây. */
+	static uint32_t chunk_n;
+	static uint32_t nomem_total;
+	if (atomic_get(&read_abort_flag)) { chunk_n = nomem_total = 0; return -ECANCELED; }
+	chunk_n++;
+	/* Per-chunk logging is too chatty at multi-thousand-chunk transfers;
+	 * keep one boundary log every 500 chunks (~2 min @ 5 KB/s) for sanity. */
+	if (chunk_n == 1 || (chunk_n % 500) == 0) {
+		LOG_INF("read_chunk_cb #%u: %u B sent so far, nomem_total=%u",
+			chunk_n, chunk_n * 240, nomem_total);
+	}
 	for (int i = 0; i < 20; i++) {
 		if (atomic_get(&read_abort_flag)) return -ECANCELED;
 		int ret = data_notify(chunk, len);
 		if (ret == 0) return 0;
-		if (ret != -ENOMEM && ret != -EAGAIN) {
-			LOG_ERR("read_chunk_cb: data_notify: %d", ret);
-			return -EIO;
+		if (ret == -ENOMEM || ret == -EAGAIN) {
+			nomem_total++;
+			k_msleep(5);
+			continue;
 		}
-		k_msleep(5);
+		LOG_ERR("read_chunk_cb #%u: data_notify: %d", chunk_n, ret);
+		return -EIO;
 	}
-	LOG_ERR("read_chunk_cb: TX buffer stuck after retries");
+	LOG_ERR("read_chunk_cb #%u: TX buffer stuck after 20×5ms retries "
+		"(nomem_total=%u)", chunk_n, nomem_total);
 	return -EIO;
 }
 
@@ -506,6 +595,15 @@ int ble_sync_init(void)
 {
 	k_work_init(&list_work, list_work_handler);
 	k_work_init(&read_work, read_work_handler);
+	data_notify_init_once();
+
+	/* #34: bring up the dedicated READ work queue. Must complete BEFORE
+	 * any client can write OP_READ; ble_sync_init is called from main()
+	 * before start_ble(), so this ordering is fine. */
+	k_work_queue_start(&read_wq, read_wq_stack,
+			   K_THREAD_STACK_SIZEOF(read_wq_stack),
+			   READ_WQ_PRIO, NULL);
+	k_thread_name_set(&read_wq.thread, "ble_read_wq");
 	LOG_INF("Sync Service registered (UUID base 7e7e0001-...).");
 	return 0;
 }

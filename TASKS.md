@@ -109,12 +109,9 @@ Bài học kỹ thuật quan trọng nhất của v1.0: `docs/POSTMORTEM_SD_WRIT
 
 ## Hardening — open follow-ups (không block v1.0, không là v1.1 feature)
 
-**#31 ⏳ Boot timing margin — settle delay trước probe I²C/IMU**
-- Triệu chứng: thi thoảng IMU báo `WHO_AM_I = 0xFF` ở boot (đặc biệt sau flash, MCU reset nhưng LDO + LSM6DSL chưa POR xong). Hiện code tiếp tục OK do retry nội bộ ở chỗ khác, nhưng cảnh báo nhỏ trong RTT log không đẹp.
-- LSM6DSL datasheet: ~25 ms từ POR tới WHO_AM_I valid.
-- Fix proposal: thêm `k_msleep(100)` ngay đầu `main()` trước `led_init() / battery_init() / imu_init()`. Cost: 100 ms boot delay, không đáng kể.
-- Tương đương với power-settle của `sdlog_init` ở #26 (đã làm cho SD), giờ làm cho phần còn lại.
-- Low priority — không gây production issue, chỉ là defensive coding.
+**#31 ✅ Boot timing margin** (2026-05-14)
+- Combined fix: `k_msleep(100)` ngay đầu `main()` (general power-rail settle) **plus** retry loop trong `imu_init` (5 × 50 ms với LSM6DSL POR). 100 ms alone không đủ — bench RTT cho thấy IMU vẫn 0xFF attempt 1 dù sau settle delay; retry attempt 2 (sau thêm 50 ms) success.
+- Verified: `<err> IMU init failed` đã không còn ở cold boot; thay vào đó là `<wrn> WHO_AM_I=0xFF try 1/5` rồi `<inf> WHO_AM_I OK on attempt 2`. Defensive, không ảnh hưởng happy path.
 
 **#35 ✅ Firmware silent halt on READ of crash-truncated audio.wav** (2026-05-14)
 
@@ -168,13 +165,9 @@ Fix combined trong commit này:
 
 Verified bench: imu.csv 170 KB sync in 31.6 s (5.3 KB/s). Audio bulk transfer streaming clean qua chunk #1125 (270 KB) tested via RTT capture, nomem_total=0. Throughput ceiling ~5 KB/s từ serial 1-in-flight cb pattern; multi-credit version vẫn có thể tăng future, nhưng correctness first.
 
-**#33 ⏳ `sdlog_init` stuck-state recovery sau crash**
-- Triệu chứng: sau khi production crash (`-116` từ SD), thẻ vào trạng thái stuck — CMD0 cold-init fail repeatedly. `sdlog_init` hiện có 100 ms power-settle + 3 × 200 ms retry không đủ recover.
-- Cách giải tạm hiện tại: rút SD ra cắm lại (hard power-cycle slot).
-- End-user scenario: dùng pin với SW1, lần next boot là cold start với SD slot đã power-cycle theo MCU → không gặp stuck-state. Issue chỉ visible khi debug với J-Link cấp VTref liên tục.
-- Fix proposal: extend retry budget trong `sdlog_init` (10 × 500 ms = 5 s total), thêm explicit CMD0 ping với delay dài hơn (1-2 s) cho stuck card warm-up.
-- Phụ thuộc hardware: PCB v1.1+ có thể thêm hardware power-cycle line cho SD VCC (đã track trong `docs/PRODUCTION_TODO.md § Hardware`). Lúc đó firmware có thể GPIO toggle để hard-reset SD slot mà không cần user can thiệp.
-- Low priority cho v1.0 (production user dùng pin sẽ không gặp), nhưng cần cho QA bench testing.
+**#33 ✅ `sdlog_init` stuck-state recovery sau crash** (2026-05-14)
+- Extended retry budget từ 3 × 200 ms = 600 ms lên **8 × 500 ms = 4 s total**, plus existing 100 ms initial settle. Đủ thời gian cho card supervisor timeout + accept fresh CMD0 sau production crash leaves it stuck. Healthy card vẫn cold-init attempt 1 (no penalty).
+- Hardware-side proper fix (GPIO power-cycle line) vẫn tracked trong `docs/PRODUCTION_TODO.md § Hardware` cho PCB v1.1+. Firmware retry là band-aid acceptable cho v1.0 bench scenarios; production pin-only users không gặp stuck-state vì SD slot tự power-cycle theo MCU.
 
 ---
 
@@ -197,8 +190,7 @@ Update tiếp 2026-05-14 (Apple DLE deep-dive): tăng N_NOTIFY_SLOTS=16 + interv
 
 Update cuối 2026-05-14 (scope clarification): mục tiêu "10-min stereo 16k sync < 10-min" là tự đẩy lên, **không phải product requirement thực**. Raw 2-mic audio dùng để **dev noise-cancel algorithm** trên PC; bulk transfer qua **rút SD card**, không qua BLE. BLE sync trong v1.1 phục vụ: control + meta + IMU + audio sample nhỏ để verify recording health. Production v2+ truyền chỉ filtered heart+lung (voice/ambient bị strip on-device cho privacy) → bandwidth tự nhiên thấp, 17 KB/s thừa. **17 KB/s ceiling không block production**. Xem memory `project_sync_scope.md` cho rationale đầy đủ.
 
-Hardening còn lại — không block v1.1, defer như v1.0 đã defer #29/#33:
-- (Không còn open limits sau khi #34/#35 đóng.) Hardware-class follow-ups #29/#31/#33 stay open as before.
+Hardening: #31 + #33 đóng cùng v1.1 (commit `2026-05-14`). #29 SD card EOL vẫn là hardware-class (firmware side đã đóng qua #32, operational mitigation = vet new cards trước production trong `docs/PRODUCTION_TODO.md`).
 
 Production v1.1 firmware sẵn sàng cho field test với Apple host throughput ceiling đã document.
 

@@ -262,6 +262,13 @@ int main(void)
 	LOG_INF("SensaPulse v1.0 — task #14 main FSM");
 	LOG_INF("Build: %s %s", __DATE__, __TIME__);
 
+	/* #31: settle delay before probing peripherals. The LDO + LSM6DSL +
+	 * micro-SD all need ~25-50 ms after VDD ramp; without this margin the
+	 * IMU sporadically reports WHO_AM_I=0xFF on cold boot (the bus reads
+	 * before the chip finishes its POR sequence). Equivalent in spirit
+	 * to the 100 ms settle that sdlog_init already does for SD (#26). */
+	k_msleep(100);
+
 	if (led_init() == 0)     LOG_INF("LED ready");
 
 	int boot_batt_mv = -1;

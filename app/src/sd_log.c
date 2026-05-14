@@ -34,36 +34,46 @@ int sdlog_print_info(void)
 	return 0;
 }
 
-/* #26: cold-boot init was failing CMD0/CMD8 in ~60 % of fresh boots on
- * this PCB, especially right after a J-Link flash (Vcc transient + card
- * reset timing). Two mitigations stacked here:
+/* #26 + #33: SD cold-boot init can fail for two distinct reasons:
  *
- *  (a) 100 ms power/clock settle before the first disk_access_init().
+ *  (a) Power/clock settle on fresh boot (the original #26 problem).
  *      The SD spec requires ≥ 1 ms after Vcc rise + ≥ 74 SCLK idle
  *      cycles before CMD0; the sdhc_spi driver does the SCLK part but
- *      not always with enough margin against in-rush noise. 100 ms is
- *      far above the 1 ms minimum and adds negligible boot delay.
+ *      not always with enough margin against J-Link Vcc transients.
+ *      Mitigation: 100 ms initial settle.
  *
- *  (b) Up to 3 retries with 200 ms gap if the first init fails. Lets
- *      the card's internal supervisor finish self-init even if it was
- *      mid-startup when we issued CMD0.
+ *  (b) Card-internal init mid-startup. Mitigation: a small retry budget.
+ *      For ~60 % cold-boot failures on this PCB, 3 × 200 ms was enough.
+ *
+ *  (c) #33 stuck-state recovery: after a production crash that returned
+ *      `-116` mid-write, the card can enter a "stuck" state where CMD0
+ *      cold-init keeps failing for a few seconds until the card's
+ *      internal supervisor times out and accepts a fresh CMD0. Extended
+ *      retry budget (8 × 500 ms = 4 s total, on top of the 100 ms
+ *      settle) covers this without lengthening normal cold boot
+ *      meaningfully — first attempt succeeds on healthy cards. The
+ *      proper hardware-side fix is a GPIO line that can power-cycle
+ *      the SD slot; tracked in `docs/PRODUCTION_TODO.md § Hardware`.
  */
 int sdlog_init(void)
 {
 	k_msleep(100);  /* (a) settle */
 
 	int ret = -EIO;
-	for (int attempt = 1; attempt <= 3; attempt++) {
+	const int max_attempts = 8;
+	const int retry_gap_ms = 500;
+	for (int attempt = 1; attempt <= max_attempts; attempt++) {
 		ret = sdlog_print_info();
 		if (ret == 0) {
 			if (attempt > 1) {
-				LOG_INF("SD init OK on attempt %d", attempt);
+				LOG_INF("SD init OK on attempt %d (after %d ms warm-up)",
+					attempt, (attempt - 1) * retry_gap_ms);
 			}
 			break;
 		}
-		LOG_WRN("SD init attempt %d failed: %d — retrying in 200 ms",
-			attempt, ret);
-		k_msleep(200);  /* (b) gap */
+		LOG_WRN("SD init attempt %d/%d failed: %d — retrying in %d ms",
+			attempt, max_attempts, ret, retry_gap_ms);
+		k_msleep(retry_gap_ms);
 	}
 	if (ret) return ret;
 

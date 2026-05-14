@@ -70,11 +70,28 @@ int imu_init(void)
 		LOG_ERR("I2C bus not ready");
 		return -ENODEV;
 	}
-	k_msleep(50);  /* LSM6DSL boot ~35ms */
+	k_msleep(50);  /* LSM6DSL POR is ~35 ms typical */
 
-	uint8_t who = imu_who_am_i();
+	/* #31: on cold boot the I²C read of WHO_AM_I sometimes returns 0xFF
+	 * (chip still in POR or LDO ramp not settled). 50 ms alone is on the
+	 * edge; retry up to 5× with 50 ms gap so a slow rail or cold LSM6DSL
+	 * gets up to ~300 ms total before we declare init failed. */
+	uint8_t who = 0xFF;
+	for (int attempt = 1; attempt <= 5; attempt++) {
+		who = imu_who_am_i();
+		if (who == LSM6DSL_WHO_AM_I_VAL) {
+			if (attempt > 1) {
+				LOG_INF("WHO_AM_I OK on attempt %d (%d ms warm-up)",
+					attempt, (attempt - 1) * 50);
+			}
+			break;
+		}
+		LOG_WRN("WHO_AM_I=0x%02X (expected 0x%02X) try %d/5",
+			who, LSM6DSL_WHO_AM_I_VAL, attempt);
+		k_msleep(50);
+	}
 	if (who != LSM6DSL_WHO_AM_I_VAL) {
-		LOG_ERR("Unexpected WHO_AM_I = 0x%02X", who);
+		LOG_ERR("IMU not responsive after retries: WHO_AM_I=0x%02X", who);
 		return -EIO;
 	}
 

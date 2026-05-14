@@ -51,3 +51,7 @@ Thumbs.db
 secrets/
 device.name
 sync_state.json
+
+# v2 algorithm work: WAV outputs are large (8 MB each) and reproducible from
+# the scripts. Keep PNGs (visual evidence), skip audio.
+notebooks/figures/*.wav

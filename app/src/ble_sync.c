@@ -49,15 +49,28 @@ static bool ctrl_subscribed;
 static bool data_subscribed;
 static struct bt_conn *current_conn;          /* refcounted; cleared on disconnect */
 
-/* #34: forward decl for data-notify credit (used by track_disconnected). */
-static struct k_sem data_notify_credit;
-static bool         data_notify_inited;
+/* #34: forward decl for data-notify state (used by track_disconnected). */
+#define N_NOTIFY_SLOTS  16
+struct notify_slot {
+	struct bt_gatt_notify_params params;
+	uint8_t                      buf[244];
+	atomic_t                     in_use;
+};
+static struct notify_slot notify_slots[N_NOTIFY_SLOTS];
+static struct k_sem       data_notify_credit;
+static bool               data_notify_inited;
 
-/* #19.7: negotiate high-throughput link parameters after connect.
- * Peripheral chỉ request PHY + data-len + conn-interval. MTU exchange
- * thường do host (PC) initiate; Zephyr peripheral phản hồi với min(247,
- * host_max). bt_gatt_exchange_mtu (client-initiated) cần BT_GATT_CLIENT
- * config nên bỏ qua. */
+/* #19.7 + #34: negotiate high-throughput link parameters after connect.
+ *
+ * Observation (bench 2026-05-14): macOS Core Bluetooth coerced the
+ * connection interval *up* to 45 ms when we didn't request one
+ * explicitly. At 45 ms interval the controller can't fill its link
+ * even with multi-credit notify flow → throughput stalled around
+ * 5 KB/s. Request 7.5-15 ms now; macOS may still coerce, but at least
+ * we start with a faster ask.
+ *
+ * Also retry data-length update — macOS sometimes refuses the first
+ * request silently. */
 static void negotiate_link(struct bt_conn *conn)
 {
 	int ret = bt_conn_le_phy_update(conn, BT_CONN_LE_PHY_PARAM_2M);
@@ -66,11 +79,56 @@ static void negotiate_link(struct bt_conn *conn)
 	ret = bt_conn_le_data_len_update(conn, BT_LE_DATA_LEN_PARAM_MAX);
 	if (ret) LOG_WRN("data_len_update: %d", ret);
 
-	/* Connection interval: KHÔNG explicit request — macOS coerce trên
-	 * dynamic param_update + có thể disconnect connection nếu phía
-	 * peripheral push notify rate quá nhanh trong khi đang re-negotiate.
-	 * Host sẽ chọn interval của riêng nó. Throughput tuning ở task #34
-	 * (callback-based flow control) sẽ hiệu quả hơn là cố ép interval. */
+	/* min=6 (7.5 ms), max=12 (15 ms), latency=0, timeout=400 (4 s).
+	 * macOS Core Bluetooth typically grants 15 ms; if it coerces wider
+	 * we still benefit vs the previous 45 ms it picked unilaterally. */
+	/* Range request: min=6 (7.5 ms), max=12 (15 ms). macOS commonly
+	 * grants 15 ms; forcing min=max=6 caused it to reject entirely and
+	 * stay at 30 ms (bench 2026-05-14). Range gives the host room to
+	 * negotiate but ensures we don't accept the macOS default 45 ms. */
+	struct bt_le_conn_param param = BT_LE_CONN_PARAM_INIT(6, 12, 0, 400);
+	ret = bt_conn_le_param_update(conn, &param);
+	if (ret) LOG_WRN("param_update: %d", ret);
+}
+
+static void log_link_info(struct bt_conn *conn)
+{
+	struct bt_conn_info info;
+	if (bt_conn_get_info(conn, &info) == 0 && info.type == BT_CONN_TYPE_LE) {
+		LOG_INF("link: interval=%u (%u.%02u ms) latency=%u timeout=%u",
+			info.le.interval,
+			(info.le.interval * 125) / 100,
+			((info.le.interval * 125) % 100),
+			info.le.latency, info.le.timeout);
+	}
+}
+
+static void on_le_param_updated(struct bt_conn *conn, uint16_t interval,
+				uint16_t latency, uint16_t timeout)
+{
+	ARG_UNUSED(latency); ARG_UNUSED(timeout);
+	LOG_INF("le_param_updated: interval=%u (%u.%02u ms)", interval,
+		(interval * 125) / 100, (interval * 125) % 100);
+	ARG_UNUSED(conn);
+}
+
+static void on_le_phy_updated(struct bt_conn *conn,
+			      struct bt_conn_le_phy_info *param)
+{
+	LOG_INF("le_phy_updated: tx=%u rx=%u (1=1M 2=2M)",
+		param->tx_phy, param->rx_phy);
+	/* Retry DLE now that PHY is on 2M — some hosts (macOS) accept DLE
+	 * only after PHY settles, not at the connect moment. */
+	int ret = bt_conn_le_data_len_update(conn, BT_LE_DATA_LEN_PARAM_MAX);
+	if (ret) LOG_WRN("data_len_update (post-PHY): %d", ret);
+}
+
+static void on_le_data_len_updated(struct bt_conn *conn,
+				   struct bt_conn_le_data_len_info *info)
+{
+	ARG_UNUSED(conn);
+	LOG_INF("le_data_len: tx_max=%u rx_max=%u",
+		info->tx_max_len, info->rx_max_len);
 }
 
 static void track_connected(struct bt_conn *conn, uint8_t err)
@@ -78,6 +136,7 @@ static void track_connected(struct bt_conn *conn, uint8_t err)
 	if (err) return;
 	if (current_conn) bt_conn_unref(current_conn);
 	current_conn = bt_conn_ref(conn);
+	log_link_info(conn);
 	negotiate_link(conn);
 }
 
@@ -88,19 +147,27 @@ static void track_disconnected(struct bt_conn *conn, uint8_t reason)
 		bt_conn_unref(current_conn);
 		current_conn = NULL;
 	}
-	/* #34: force-release the data-notify credit in case the pending TX
-	 * callback never fires (e.g., abrupt link drop mid-stream). Without
-	 * this the next session's first notify would block 3 s waiting for
-	 * the ghost callback. */
+	/* #34: hard-reset multi-credit notify state. Abrupt disconnect can
+	 * leave slots `in_use=1` with their callbacks never invoked (Zephyr
+	 * usually still fires them, but be defensive). Without this the next
+	 * session would run with fewer credits or stall on the missing slot. */
 	if (data_notify_inited) {
+		for (int i = 0; i < N_NOTIFY_SLOTS; i++) {
+			atomic_set(&notify_slots[i].in_use, 0);
+		}
 		k_sem_reset(&data_notify_credit);
-		k_sem_give(&data_notify_credit);
+		for (int i = 0; i < N_NOTIFY_SLOTS; i++) {
+			k_sem_give(&data_notify_credit);
+		}
 	}
 }
 
 BT_CONN_CB_DEFINE(ble_sync_conn_cb) = {
-	.connected    = track_connected,
-	.disconnected = track_disconnected,
+	.connected        = track_connected,
+	.disconnected     = track_disconnected,
+	.le_param_updated = on_le_param_updated,
+	.le_phy_updated   = on_le_phy_updated,
+	.le_data_len_updated = on_le_data_len_updated,
 };
 
 static void ctrl_ccc_cfg(const struct bt_gatt_attr *attr, uint16_t value)
@@ -164,34 +231,41 @@ static int ctrl_notify(const uint8_t *frame, size_t len)
 	return -EIO;
 }
 
-/* ---------- Data notify with serial flow control — #34 ---------- *
- * Pre-fix bug: bt_gatt_notify() returned 0 even when ACL TX pool was
- * exhausted, silently dropping the data. Bisect (2026-05-14) showed the
- * cliff is exactly CONFIG_BT_BUF_ACL_TX_COUNT chunks: with TX_COUNT=10,
- * 8-10 chunks deliver and the rest vanish; TX_COUNT=32 pushes cliff to
- * ~31 chunks.
+/* ---------- Data notify with multi-credit flow control — #34 ---------- *
+ * History (2026-05-14): pre-fix `bt_gatt_notify()` returned 0 even when
+ * ACL TX pool was exhausted, silently dropping PDUs at exactly
+ * CONFIG_BT_BUF_ACL_TX_COUNT chunks. First fix used `bt_gatt_notify_cb`
+ * with a single in-flight slot — correct but ~5 KB/s. For 10-min
+ * audio.wav (~38 MB) that's 2 h sync; target is ≤ recording time
+ * (≤ 10 min) so we need ≥ 80 KB/s.
  *
- * Real fix: bt_gatt_notify_cb with a 1-permit semaphore. The completion
- * callback runs when the controller has transmitted the PDU (slot in
- * ACL TX pool freed), so we never overrun.
+ * Multi-credit version: N parallel slots, each with its own persistent
+ * params + buf. Caller takes a free-slot permit, fills the slot, queues
+ * `bt_gatt_notify_cb`; completion releases the slot. This lets the
+ * controller keep its pipe full while we keep correct backpressure.
  *
- * Tradeoff: 1 in-flight ≈ 1 notify per BLE connection interval (7.5-15
- * ms typical). At 240 B/chunk: 16-32 kB/s realistic — slow but correct.
- * Multi-credit version is a follow-up; correctness first. */
-static struct bt_gatt_notify_params data_notify_params;
-static uint8_t                      data_notify_buf[244];
-
+ * N=8 chosen against CONFIG_BT_BUF_ACL_TX_COUNT=32 (lots of headroom
+ * for ctrl notifies, EATT chatter, etc.). At 240 B/chunk × 8 in-flight,
+ * the controller can saturate a 7.5-15 ms BLE connection interval
+ * (~80-200 KB/s theoretical with PHY 2M). macOS typically grants 15 ms;
+ * realistic target ~50-80 KB/s. */
 static void data_notify_init_once(void)
 {
 	if (data_notify_inited) return;
-	k_sem_init(&data_notify_credit, 1, 1);
+	k_sem_init(&data_notify_credit, N_NOTIFY_SLOTS, N_NOTIFY_SLOTS);
+	for (int i = 0; i < N_NOTIFY_SLOTS; i++) {
+		atomic_set(&notify_slots[i].in_use, 0);
+	}
 	data_notify_inited = true;
 }
 
 static void on_data_notify_done(struct bt_conn *conn, void *user_data)
 {
 	ARG_UNUSED(conn);
-	ARG_UNUSED(user_data);
+	struct notify_slot *slot = user_data;
+	if (slot) {
+		atomic_set(&slot->in_use, 0);
+	}
 	k_sem_give(&data_notify_credit);
 }
 
@@ -200,31 +274,49 @@ static int data_notify(const uint8_t *frame, size_t len)
 	if (!current_conn) return -ENOTCONN;
 	if (!data_subscribed) return -EACCES;
 
-	/* 0-byte EOF terminator: send directly, no credit needed. */
+	/* 0-byte EOF terminator: send directly, no slot needed. */
 	if (len == 0) {
 		return bt_gatt_notify(current_conn,
 				      &ble_sync_svc.attrs[ATTR_DATA_VAL],
 				      frame, len);
 	}
-	if (len > sizeof(data_notify_buf)) return -EINVAL;
+	if (len > sizeof(notify_slots[0].buf)) return -EINVAL;
 
-	/* Block waiting for the previous chunk's controller-TX-complete
-	 * callback. 3 s ceiling — if the link is wedged, give up so the
-	 * caller can report -EIO and the host can recover. */
+	/* Block waiting for a free slot. 3 s ceiling — if the link is
+	 * wedged (no callbacks firing), give up so the caller can report
+	 * -EIO and the host can recover. */
 	if (k_sem_take(&data_notify_credit, K_SECONDS(3))) {
 		LOG_ERR("data_notify: credit timeout (link wedged?)");
 		return -ETIMEDOUT;
 	}
 
-	memcpy(data_notify_buf, frame, len);
-	data_notify_params = (struct bt_gatt_notify_params){
-		.attr = &ble_sync_svc.attrs[ATTR_DATA_VAL],
-		.data = data_notify_buf,
-		.len  = len,
-		.func = on_data_notify_done,
+	/* The semaphore guarantees >=1 slot is free; find it. atomic_cas
+	 * keeps us safe even if a callback races with this scan. */
+	struct notify_slot *slot = NULL;
+	for (int i = 0; i < N_NOTIFY_SLOTS; i++) {
+		if (atomic_cas(&notify_slots[i].in_use, 0, 1)) {
+			slot = &notify_slots[i];
+			break;
+		}
+	}
+	if (!slot) {
+		/* Should not happen: sem accounting and slot bitmap diverged. */
+		LOG_ERR("data_notify: sem held but no free slot");
+		k_sem_give(&data_notify_credit);
+		return -EIO;
+	}
+
+	memcpy(slot->buf, frame, len);
+	slot->params = (struct bt_gatt_notify_params){
+		.attr      = &ble_sync_svc.attrs[ATTR_DATA_VAL],
+		.data      = slot->buf,
+		.len       = len,
+		.func      = on_data_notify_done,
+		.user_data = slot,
 	};
-	int ret = bt_gatt_notify_cb(current_conn, &data_notify_params);
+	int ret = bt_gatt_notify_cb(current_conn, &slot->params);
 	if (ret) {
+		atomic_set(&slot->in_use, 0);
 		k_sem_give(&data_notify_credit);
 		return ret;
 	}

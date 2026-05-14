@@ -14,6 +14,8 @@ When the user asks for things needing image analysis, schematic reading, or stra
 
 Wearable stethoscope worn 24/7. Two PDM mics (body + ambient), 6-axis IMU, micro-SD logging, no BLE in v1 firmware. Goal: collect clean labelable data on SD for offline AI training (heart/lung/cough separation, activity classification).
 
+**Sync scope (clarified 2026-05-14)** — bulk raw 2-mic audio is **NOT meant to go over BLE**. Dev workflow: pull SD card and read directly. BLE sync (v1.1) is for control + meta + IMU + small audio verification samples. Production (v2+): on-device noise-cancellation strips voice/ambient, only filtered heart+lung audio leaves the device — that's privacy-by-design and naturally small over BLE. Don't optimize BLE as if it had to stream raw stereo 16 kHz audio.
+
 User profile: biomedical signal-processing engineer, Python-first, has built ECG/PPG models. Firmware (Zephyr/C) is outside his daily work — frame embedded explanations in terms of signal pipelines (DMA = streaming buffer, PDM decimation = front-end filter, etc.). User communicates in Vietnamese. Reply in Vietnamese unless he switches.
 
 ## Hardware (PCB v1.0, schematic dated 2026-04-09)

@@ -191,12 +191,14 @@ BLE sync happy path đầy đủ. Spec `docs/SYNC_PROTOCOL.md` đã implemented 
 - ACK loop removes `.unsynced` markers
 - Eviction (#17): `sd_writer_get_free_mb` + `find_oldest_synced` + 5-unlink folder removal, all through writer thread (single-FATFS-owner invariant intact)
 
-Update 2026-05-14: **#34 + #35 đã được fix** (commit `9b5fc1b`). Bulk READ giờ hoạt động end-to-end với serial credit-based flow control + dedicated work queue. Verified bench: imu.csv 170 KB sync clean (5.3 KB/s), audio.wav session 14 (file đã từng làm firmware hang) syncs clean trong 3.8 s. Throughput ceiling ~5 KB/s; 38 MB audio.wav full = ~2 giờ — chấp nhận được cho v1.1 với multi-credit optimization là follow-up nếu cần.
+Update 2026-05-14: **#34 + #35 đã được fix** (commit `9b5fc1b`). Bulk READ giờ hoạt động end-to-end với serial credit-based flow control + dedicated work queue. Verified bench: imu.csv 170 KB sync clean (5.3 KB/s), audio.wav session 14 (file đã từng làm firmware hang) syncs clean trong 3.8 s.
+
+Update tiếp 2026-05-14 (Apple DLE deep-dive): tăng N_NOTIFY_SLOTS=16 + interval 15 ms request + L2CAP CoC (PSM `0x0080`) đẩy throughput lên 14-17 KB/s. HCI DBG log xác nhận **Apple Core Bluetooth từ chối DLE** (LL_LENGTH_RSP 27/27 cả macOS và iOS). Hard cap LL=27 byte không thể vượt qua từ firmware side. Throughput ceiling ~17 KB/s ↔ Apple host. Không meet target "10-min data < 10-min sync" cho 16 kHz stereo audio (38 MB → 38 phút sync). Production decision needed: reduce data (mono / 8 kHz), compression on FW, USB transport (PCB v1.1+), hoặc accept overnight-dock UX. Xem CLAUDE.md Discovered note 2026-05-14 cho phép số chi tiết.
 
 Hardening còn lại — không block v1.1, defer như v1.0 đã defer #29/#33:
 - (Không còn open limits sau khi #34/#35 đóng.) Hardware-class follow-ups #29/#31/#33 stay open as before.
 
-Production v1.1 firmware sẵn sàng cho field test full flow.
+Production v1.1 firmware sẵn sàng cho field test với Apple host throughput ceiling đã document.
 
 ---
 

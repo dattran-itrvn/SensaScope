@@ -11,6 +11,8 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/l2cap.h>
+#include <zephyr/net_buf.h>
 #include <zephyr/logging/log.h>
 
 #include <stdio.h>
@@ -231,6 +233,102 @@ static int ctrl_notify(const uint8_t *frame, size_t len)
 	return -EIO;
 }
 
+/* ---------- L2CAP CoC server for high-throughput bulk transfer — #34 ----- *
+ * macOS Core Bluetooth caps GATT-notify throughput around 14 kB/s
+ * (no DLE, ~8 packets per connection event). L2CAP Connection-Oriented
+ * Channel has its own credit-based flow that macOS schedules more
+ * generously — bench reports show 30-60 kB/s realistic.
+ *
+ * PSM 0x0080 is in the LE dynamic range (0x0080-0x00FF). PC side opens
+ * the channel after GATT connect, then issues OP_READ via Control; the
+ * READ stream goes through this CoC instead of GATT Data notify.
+ */
+#define SP_L2CAP_PSM       0x0080
+#define SP_L2CAP_MTU       1024   /* SDU MTU: gets segmented at LL layer */
+
+static struct bt_l2cap_le_chan sp_l2cap_le_chan;
+static struct bt_l2cap_chan   *sp_l2cap_chan;     /* non-NULL while open */
+
+NET_BUF_POOL_DEFINE(sp_l2cap_tx_pool, 16,
+		    BT_L2CAP_SDU_BUF_SIZE(SP_L2CAP_MTU),
+		    CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+
+static void sp_l2cap_connected(struct bt_l2cap_chan *chan)
+{
+	struct bt_l2cap_le_chan *le = BT_L2CAP_LE_CHAN(chan);
+	sp_l2cap_chan = chan;
+	LOG_INF("L2CAP CoC connected: tx_mtu=%u tx_mps=%u rx_mtu=%u rx_mps=%u",
+		le->tx.mtu, le->tx.mps, le->rx.mtu, le->rx.mps);
+}
+
+static void sp_l2cap_disconnected(struct bt_l2cap_chan *chan)
+{
+	ARG_UNUSED(chan);
+	sp_l2cap_chan = NULL;
+	LOG_INF("L2CAP CoC disconnected");
+}
+
+static int sp_l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
+{
+	/* Peripheral only sends; ignore any unexpected RX. */
+	ARG_UNUSED(chan);
+	LOG_INF("L2CAP CoC RX (ignored): %u byte", buf->len);
+	return 0;
+}
+
+static const struct bt_l2cap_chan_ops sp_l2cap_ops = {
+	.connected    = sp_l2cap_connected,
+	.disconnected = sp_l2cap_disconnected,
+	.recv         = sp_l2cap_recv,
+};
+
+static int sp_l2cap_accept(struct bt_conn *conn,
+			   struct bt_l2cap_server *server,
+			   struct bt_l2cap_chan **chan)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(server);
+	if (sp_l2cap_chan) {
+		LOG_WRN("L2CAP CoC accept: already open");
+		return -ENOMEM;
+	}
+	memset(&sp_l2cap_le_chan, 0, sizeof(sp_l2cap_le_chan));
+	sp_l2cap_le_chan.chan.ops = &sp_l2cap_ops;
+	sp_l2cap_le_chan.rx.mtu   = SP_L2CAP_MTU;
+	*chan = &sp_l2cap_le_chan.chan;
+	LOG_INF("L2CAP CoC accept (PSM 0x%04x)", SP_L2CAP_PSM);
+	return 0;
+}
+
+static struct bt_l2cap_server sp_l2cap_server = {
+	.psm       = SP_L2CAP_PSM,
+	.sec_level = BT_SECURITY_L1,    /* open for dev; production lock later */
+	.accept    = sp_l2cap_accept,
+};
+
+/* Send `len` bytes over the CoC channel. Blocking on net_buf alloc with a
+ * 2 s ceiling so the caller can detect a wedged link. Returns 0 on
+ * success or negative errno. */
+static int sp_l2cap_send(const uint8_t *data, size_t len)
+{
+	if (!sp_l2cap_chan) return -ENOTCONN;
+	struct net_buf *buf = net_buf_alloc(&sp_l2cap_tx_pool, K_SECONDS(2));
+	if (!buf) {
+		LOG_ERR("L2CAP send: net_buf_alloc timeout");
+		return -ETIMEDOUT;
+	}
+	/* Reserve headroom for L2CAP SDU header (2 byte length). */
+	net_buf_reserve(buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
+	net_buf_add_mem(buf, data, len);
+	int ret = bt_l2cap_chan_send(sp_l2cap_chan, buf);
+	if (ret < 0) {
+		net_buf_unref(buf);
+		LOG_ERR("bt_l2cap_chan_send: %d", ret);
+		return ret;
+	}
+	return 0;
+}
+
 /* ---------- Data notify with multi-credit flow control — #34 ---------- *
  * History (2026-05-14): pre-fix `bt_gatt_notify()` returned 0 even when
  * ACL TX pool was exhausted, silently dropping PDUs at exactly
@@ -272,6 +370,16 @@ static void on_data_notify_done(struct bt_conn *conn, void *user_data)
 static int data_notify(const uint8_t *frame, size_t len)
 {
 	if (!current_conn) return -ENOTCONN;
+
+	/* #34: prefer L2CAP CoC when the channel is open. PC tool opens it
+	 * after GATT connect; firmware streams READ data through CoC at
+	 * 30-60 kB/s (vs ~14 kB/s GATT-notify ceiling on macOS). The Data
+	 * characteristic notify path remains for backward-compatible clients
+	 * that don't open the CoC. */
+	if (sp_l2cap_chan && len > 0) {
+		return sp_l2cap_send(frame, len);
+	}
+
 	if (!data_subscribed) return -EACCES;
 
 	/* 0-byte EOF terminator: send directly, no slot needed. */
@@ -688,6 +796,13 @@ int ble_sync_init(void)
 	k_work_init(&list_work, list_work_handler);
 	k_work_init(&read_work, read_work_handler);
 	data_notify_init_once();
+
+	int lret = bt_l2cap_server_register(&sp_l2cap_server);
+	if (lret) {
+		LOG_ERR("bt_l2cap_server_register: %d", lret);
+	} else {
+		LOG_INF("L2CAP CoC server registered (PSM 0x%04x)", SP_L2CAP_PSM);
+	}
 
 	/* #34: bring up the dedicated READ work queue. Must complete BEFORE
 	 * any client can write OP_READ; ble_sync_init is called from main()

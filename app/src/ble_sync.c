@@ -34,8 +34,20 @@ LOG_MODULE_REGISTER(ble_sync, LOG_LEVEL_INF);
 #endif
 
 extern const char *app_state_lc(void);
-extern int app_request_start_record_via_ble(void);
-extern int app_request_stop_record_via_ble(void);
+extern int  app_request_start_record_via_ble(void);
+extern int  app_request_stop_record_via_ble(void);
+extern bool app_is_recording(void);
+
+/* v1.1.2: queue a self-disconnect after an opcode reply so the link is
+ * not held during RECORDING. 150 ms gives the controller multiple
+ * connection events (7.5-15 ms interval) to drain the notify before
+ * we tear the link down — enough margin even on macOS' coerced 30 ms. */
+static struct k_work_delayable disconnect_work;
+static void disconnect_handler(struct k_work *w);
+static void schedule_self_disconnect(void)
+{
+	k_work_schedule(&disconnect_work, K_MSEC(150));
+}
 
 /* ---------- UUIDs ---------- */
 /* Base: 7e7e0001-3c4f-4b8e-8a8a-5e5e5e5e5e5e. Chỉ phần đầu 32 bit khác
@@ -52,6 +64,17 @@ static struct bt_uuid_128 uuid_name = BT_UUID_INIT_128(UUID128(0x7e7e0005));
 static bool ctrl_subscribed;
 static bool data_subscribed;
 static struct bt_conn *current_conn;          /* refcounted; cleared on disconnect */
+
+/* v1.1.2: actual implementation of self-disconnect (forward decl above). */
+static void disconnect_handler(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	if (current_conn) {
+		LOG_INF("self-disconnect (post opcode, FSM=%s)", app_state_lc());
+		bt_conn_disconnect(current_conn,
+				   BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+	}
+}
 
 /* #34: forward decl for data-notify state (used by track_disconnected). */
 #define N_NOTIFY_SLOTS  16
@@ -571,6 +594,22 @@ static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 	uint8_t op = p[0];
 	LOG_INF("Control write: opcode=0x%02x len=%u", op, len);
 
+	/* v1.1.2: when RECORDING, only STOP_RECORD and RESET_CTL are
+	 * honoured. STOP_RECORD goes through the FSM owner check below
+	 * (rejects owner==TAP). RESET_CTL is allowed because it only
+	 * clears local read_abort_flag — no FATFS access, no data path
+	 * impact, and tools/sync.py issues it routinely as part of its
+	 * setup() before any real op. Everything else (LIST/READ/ACK/
+	 * DEL/ABORT) needs FATFS access and is refused with BUSY plus
+	 * self-disconnect to keep the link off the recording's back. */
+	if (app_is_recording() && op != OP_STOP_RECORD && op != OP_RESET_CTL) {
+		uint8_t reply[2] = { op, ST_BUSY };
+		ctrl_notify(reply, sizeof(reply));
+		LOG_INF("Opcode 0x%02x refused: RECORDING in progress", op);
+		schedule_self_disconnect();
+		return len;
+	}
+
 	switch (op) {
 	case OP_LIST:
 		k_work_submit(&list_work);
@@ -666,6 +705,10 @@ static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 		uint8_t reply[2] = { op, st };
 		ctrl_notify(reply, sizeof(reply));
 		LOG_INF("START_RECORD: ret=%d status=0x%02x", record_result, st);
+		/* v1.1.2: release link regardless of outcome. PC's intent on
+		 * BLE-start is fire-and-disconnect; failure paths shouldn't
+		 * leave the link sitting open either. */
+		schedule_self_disconnect();
 		return len;
 	}
 	case OP_STOP_RECORD: {
@@ -677,6 +720,8 @@ static ssize_t ctrl_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 		uint8_t reply[2] = { op, st };
 		ctrl_notify(reply, sizeof(reply));
 		LOG_INF("STOP_RECORD: ret=%d status=0x%02x", record_result, st);
+		/* v1.1.2: brief opcode-only attach; PC dropped here. */
+		schedule_self_disconnect();
 		return len;
 	}
 	case OP_RESET_CTL: {
@@ -857,6 +902,7 @@ int ble_sync_init(void)
 	k_work_init(&record_start_work, record_start_handler);
 	k_work_init(&record_stop_work,  record_stop_handler);
 	k_sem_init(&record_done, 0, 1);
+	k_work_init_delayable(&disconnect_work, disconnect_handler);
 	data_notify_init_once();
 
 	int lret = bt_l2cap_server_register(&sp_l2cap_server);

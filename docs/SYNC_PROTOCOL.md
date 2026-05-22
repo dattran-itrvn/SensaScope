@@ -2,27 +2,53 @@
 
 This document is the contract between the device firmware and the PC sync tool. Implement to this spec on both sides.
 
-## State machine
+## State machine (v1.1.2)
 
-The device is always in exactly one of three states:
+The device is always in exactly one of three primary states (IDLE, RECORDING, SYNC) plus two error/hold states (LOW_BATT_HOLDOFF, ERROR). A separate `rec_owner` flag tracks who started the current recording — `TAP` or `BLE` — and enforces "start by X → stop by X" symmetry.
 
 ```
-        ┌────────┐  double-tap   ┌──────────┐
-   ┌──→ │  IDLE  │ ────────────→ │ RECORDING │
-   │    └────────┘  ←─────────── └──────────┘
-   │       │           double-tap
+        ┌────────┐  double-tap (start)     ┌─────────────────┐
+   ┌──→ │  IDLE  │ ──────────────────────→ │ RECORDING       │
+   │    └────────┘  ←────────────────────  │ rec_owner=TAP   │
+   │       │       double-tap (stop)       └─────────────────┘
    │       │ BLE connect (PC tool)
-   │       ↓
-   │    ┌────────┐
-   │    │ SYNC   │
-   └─── └────────┘  BLE disconnect or done
+   │       │
+   │       ↓                  OP_START_RECORD     ┌─────────────────┐
+   │    ┌────────┐ ────────────────────────────→ │ RECORDING       │
+   │    │  SYNC  │ ←──────────────────────────── │ rec_owner=BLE   │
+   └─── └────────┘ self-disconnect after STOP    └─────────────────┘
+        ↑                                                  ↑    │
+        │                                                  │    │
+        └─── PC brief reconnect for opcode exchange ───────┘    │
+             (BUSY for non-STOP / non-RESET, then self-disconnect)
 ```
 
-- **IDLE** — LED 1 Hz blink. BLE advertising. SD has space (or has sync'd folders to evict). Listening for double-tap or BLE connect.
-- **RECORDING** — LED solid on. BLE off (controller paused). PDM + IMU + SD writers running. New session folder open with `.unsynced` marker.
-- **SYNC** — LED 2 Hz blink (preview pattern). PDM + IMU stopped. BLE connection active. PC tool drives transfers. Returns to IDLE on disconnect.
+- **IDLE** — LED 1 pulse/3s (sparse heartbeat per #22). BLE advertising. SD has space (or has sync'd folders to evict). Listening for double-tap or BLE connect.
+- **RECORDING** — LED 2 pulses/5s. **BLE advertising stays on** (v1.1.2). PDM + IMU + SD writers running. New session folder open with `.unsynced` marker.
+- **SYNC** — LED 2 Hz blink. PDM + IMU stopped. BLE connection active. PC tool drives LIST/READ/ACK/DEL transfers. Returns to pre_sync_state on disconnect.
 
-`RECORDING ↔ SYNC` is forbidden when RECORDING was started by a local double-tap. **However v1.1.1 allows the inverse**: a PC tool in the SYNC state can issue `OP_START_RECORD` to begin recording while the BLE link stays connected. The connection persists through the recording so the PC can poll progress and issue `OP_STOP_RECORD` to end it. In this mode a double-tap is **ignored** ("start by X → stop by X" symmetry), and if the PC disconnects mid-record the device auto-stops the session.
+### v1.1.2 — BLE policy during RECORDING
+
+The CLAUDE.md hard rule "RECORDING turns BLE controller off" applies to the **persistent link**, not advertising. Specifically:
+
+- **Advertising**: always on, in every FSM state. Restarted in `on_disconnected()` regardless of state.
+- **Persistent connection**: only valid when device was IDLE/LOW_BATT/ERROR before connect (transitions to SYNC). During RECORDING the FSM does NOT transition on connect — the device stays in RECORDING and the opcode handler self-disconnects in ~150 ms after replying. This is the "kết nối ngắn, không giữ kết nối" model.
+- **Recording survives disconnect**: PC disconnect mid-record is NOT an implicit stop (was in v1.1.1; removed in v1.1.2 due to BLE-link-during-RECORDING crashing the SD writer at ~64s — see TASKS.md #36).
+
+### Opcode behaviour matrix
+
+| FSM state | rec_owner | OP_LIST/READ/ACK/DEL/ABORT | OP_START_RECORD | OP_STOP_RECORD | OP_RESET_CTL |
+|---|---|---|---|---|---|
+| SYNC (pre=IDLE) | NONE | OK | OK → RECORDING (owner=BLE), self-disconnect | (no record to stop) | OK |
+| RECORDING | TAP | BUSY + self-disconnect | BUSY + self-disconnect | BUSY + self-disconnect (owner mismatch) | OK (no disconnect) |
+| RECORDING | BLE | BUSY + self-disconnect | BUSY + self-disconnect (already recording) | OK → IDLE, self-disconnect | OK (no disconnect) |
+| SYNC (pre=ERROR / LOW_BATT) | NONE | OK (drain data) | BUSY + self-disconnect (pre != IDLE) | (no record to stop) | OK |
+
+### Stopping a recording
+
+- **rec_owner=TAP**: only by double-tap, by `batt < BATT_LOW_MV` (LOW_BATT_HOLDOFF auto-stop), by SD full (ERROR), or by SW1 power cut.
+- **rec_owner=BLE**: only by `OP_STOP_RECORD` over a fresh BLE connection, by batt low, by SD full, or by SW1 power cut.
+- In all cases `rec_owner` is reset to NONE on FSM exit from RECORDING.
 
 ## On-SD layout
 

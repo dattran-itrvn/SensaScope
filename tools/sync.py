@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -402,6 +403,13 @@ def main() -> int:
                    help="debug: cap READ length per file (0 = to EOF)")
     p.add_argument("--scan-timeout", type=float, default=5.0,
                    help="seconds to scan for devices (default: 5)")
+    p.add_argument("--start-record", action="store_true",
+                   help="v1.1.1: send OP_START_RECORD then hold the link until killed "
+                        "or --hold seconds elapse (disconnect = firmware auto-stop)")
+    p.add_argument("--stop-record", action="store_true",
+                   help="v1.1.1: send OP_STOP_RECORD then exit")
+    p.add_argument("--hold", type=float, default=0.0,
+                   help="seconds to hold the link after START_RECORD (0 = until killed)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -428,6 +436,60 @@ def main() -> int:
             if not devs:
                 log.error("no device matched name=%s", args.device)
                 return 1
+
+        if args.start_record or args.stop_record:
+            if len(devs) != 1:
+                log.error("expected exactly 1 device, found %d — use --device to filter",
+                          len(devs))
+                return 1
+            addr, name = devs[0]
+            action = "start" if args.start_record else "stop"
+            log.info("controlling %s (%s) → %s_record", name, addr, action)
+            async with BleakClient(addr) as client:
+                sess = SyncSession(client)
+                await sess.setup()
+                info = await sess.fetch_info()
+                log.info("device info: %s", info)
+                state = info.get("state", "?")
+                if action == "start":
+                    if state == "recording":
+                        log.error("device is already recording — refusing")
+                        return 1
+                    await sess.cmd_start_record()
+                    log.info("START_RECORD ok — device should now be RECORDING (LED 2-pulse)")
+                    hold = args.hold if args.hold > 0 else float("inf")
+                    log.info("holding link for %s — Ctrl+C / kill PID %d to stop "
+                             "(disconnect = firmware auto-stop)",
+                             "until killed" if hold == float("inf") else f"{hold:.0f}s",
+                             os.getpid())
+                    try:
+                        elapsed = 0.0
+                        while elapsed < hold and client.is_connected:
+                            await asyncio.sleep(5.0)
+                            elapsed += 5.0
+                            log.info("recording… +%.0fs (still connected)", elapsed)
+                    except asyncio.CancelledError:
+                        log.info("cancelled — sending STOP_RECORD before disconnect")
+                        try:
+                            await asyncio.wait_for(sess.cmd_stop_record(), timeout=3.0)
+                        except Exception as e:
+                            log.warning("STOP_RECORD failed (%r) — disconnect will auto-stop", e)
+                        raise
+                    if client.is_connected:
+                        log.info("hold elapsed — sending STOP_RECORD")
+                        try:
+                            await sess.cmd_stop_record()
+                        except Exception as e:
+                            log.warning("STOP_RECORD failed (%r) — disconnect will auto-stop", e)
+                    else:
+                        log.warning("link dropped during hold — firmware should auto-stop")
+                else:
+                    if state != "recording":
+                        log.warning("device state=%s, not 'recording' — sending STOP anyway",
+                                    state)
+                    await sess.cmd_stop_record()
+                    log.info("STOP_RECORD ok — device returned to SYNC")
+            return 0
 
         rc = 0
         for addr, name in devs:

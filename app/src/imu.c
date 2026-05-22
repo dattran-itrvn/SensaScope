@@ -171,14 +171,19 @@ int imu_enable_double_tap(imu_tap_cb_t cb)
 
 	/* TAP_THS_6D: 5-bit threshold, 1 LSB = FS/32 = 62.5 mg at ±2 g.
 	 *
-	 * Task #22 — raise to "nấc trung" so worn-on-chest motion (walking
-	 * shocks ~0.3–0.5 g, clothing rub ~0.4–0.6 g, body roll on bed) no
-	 * longer trips double-tap. 0x14 (20 LSB) ≈ 1.25 g → still easy with
-	 * a deliberate fingertip tap on the case, rejects accidental jolts.
+	 * Task #22 raised to 0x14 (~1.25 g) to reject worn-on-chest motion.
+	 * v1.1.2 (2026-05-22): user feedback — 1.25 g requires uncomfortable
+	 * strong taps. Drop to 0x10 (~1.0 g) per #22 documented fallback.
+	 * Safe to lower now because sleep-wear sessions are BLE-started
+	 * (owner=BLE) and tap is ignored during BLE-owned record (main.c
+	 * on_double_tap), so accidental motion taps can't false-stop a
+	 * sleep recording.
 	 *
-	 * Earlier value 0x09 (~0.56 g, AN5040 demo) was too hot for 24/7 wear.
+	 * History: 0x09 (~0.56 g, AN5040 demo) too hot for 24/7 wear.
+	 *          0x14 (~1.25 g, #22) too cold for fingertip tap comfort.
+	 *          0x10 (~1.0 g, v1.1.2) — middle ground.
 	 */
-	ret = reg_write(LSM6DSL_REG_TAP_THS_6D, 0x14);
+	ret = reg_write(LSM6DSL_REG_TAP_THS_6D, 0x10);
 	if (ret) goto err;
 
 	/* INT_DUR2 = 0x4E:

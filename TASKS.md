@@ -186,7 +186,29 @@ BLE sync happy path đầy đủ. Spec `docs/SYNC_PROTOCOL.md` đã implemented 
 
 Update 2026-05-14: **#34 + #35 đã được fix** (commit `9b5fc1b`). Bulk READ giờ hoạt động end-to-end với serial credit-based flow control + dedicated work queue. Verified bench: imu.csv 170 KB sync clean (5.3 KB/s), audio.wav session 14 (file đã từng làm firmware hang) syncs clean trong 3.8 s.
 
-Update tiếp 2026-05-14 (Apple DLE deep-dive): tăng N_NOTIFY_SLOTS=16 + interval 15 ms request + L2CAP CoC (PSM `0x0080`) đẩy throughput lên 14-17 KB/s. HCI DBG log xác nhận **Apple Core Bluetooth từ chối DLE** (LL_LENGTH_RSP 27/27 cả macOS và iOS). Hard cap LL=27 byte không thể vượt qua từ firmware side. Throughput ceiling ~17 KB/s ↔ Apple host. Xem CLAUDE.md Discovered note 2026-05-14 cho chi tiết HCI.
+Update tiếp 2026-05-14 (Apple DLE deep-dive): tăng N_NOTIFY_SLOTS=16 + interval 15 ms request + L2CAP CoC (PSM `0x0080`) đẩy throughput lên 14-17 KB/s. HCI DBG log xác nhận **Apple Core Bluetooth từ chối DLE upgrade** (LL_LENGTH_RSP 27/27 cả macOS và iOS) — quan sát over-air, **không trích từ Apple-published doc**. Hard cap LL=27 byte không thể vượt qua từ firmware side. Throughput ceiling ~17 KB/s ↔ Apple host = **derived math từ measurement**, không phải Apple-stated number. 2026-05-22 bench đo 25-sample được **15.5 KB/s sustained** trên SESSION_00008 — confirm ceiling math. Apple's public "Bluetooth Accessory Design Guidelines for Apple Products" không document DLE behaviour hay throughput cap. Xem CLAUDE.md Discovered notes 2026-05-14 + 2026-05-22 cho HCI detail + measurement.
+
+**#36 ✅ BLE-during-RECORDING crash — v1.1.2 redesign** (2026-05-22)
+
+Symptom (v1.1.1): BLE-driven recording crashed FSM to ERROR (SOS LED) ~64 s in. Bench repro: `tools/sync.py --start-record --hold` (link held), audio.wav truncated at ~3.98 MB on SESSION_00002, watchdog tripped.
+
+Root cause: v1.1.1's "keep BLE link alive during BLE-driven RECORDING so PC can issue OP_STOP_RECORD" deliberately broke the CLAUDE.md "RECORDING turns BLE controller off" invariant. Apple's ~30 ms connection interval + GATT keep-alives compete with PDM IRQs (16 kHz) and the SPIM3-based sd_writer DMA. Resource contention kills the writer after ~3-4 MB.
+
+Fix v1.1.2 (per user redesign 2026-05-22 — "kết nối ngắn, không giữ kết nối"):
+- **`enum rec_owner { NONE, TAP, BLE }`** in `main.c` replaces the bool `recording_via_ble`. Cleared at every FSM exit from RECORDING (watchdog abort, batt-low, tap stop, BLE stop).
+- **BLE advertising runs in ALL states**, not just IDLE. Started once in `start_ble()`, restarted in `on_disconnected()`. Removes the `ble_adv_stop()/start()` calls from `transition()`.
+- **`on_connected()` during RECORDING**: accept the connection but DO NOT change FSM (stays in RECORDING). Opcode handler will reply and then trigger self-disconnect.
+- **`on_disconnected()`**: no more auto-stop. Recording survives PC vanish (Mac sleep, app crash, Wi-Fi drop). The only stop paths are now: OP_STOP_RECORD (owner BLE) / double-tap (owner TAP) / batt < BATT_LOW_MV / SD full → ERROR / SW1 power cut.
+- **`ble_sync.c` opcode gate**: `if (app_is_recording() && op != OP_STOP_RECORD && op != OP_RESET_CTL)` → reply ST_BUSY + `schedule_self_disconnect()` (k_work_delayable, +150 ms). OP_RESET_CTL whitelisted because it's a local-state-only op and `tools/sync.py setup()` issues it routinely; blocking it broke the STOP path.
+- **OP_START_RECORD / OP_STOP_RECORD**: both schedule self-disconnect after reply, regardless of success/failure.
+- **Tap threshold lowered**: `TAP_THS_6D 0x14 → 0x10` (~1.25 g → ~1.0 g) per #22's documented fallback. Safe to lower now: sleep-wear sessions are BLE-owned, so accidental motion taps are ignored.
+
+Verified bench 2026-05-22:
+- 100 s sustained BLE-driven recording, link NOT held → 0 SOS, 0 watchdog trips, session 9 = 7.1 MB clean WAV. Battery 4220→4186 mV normal drop. Beats v1.1.1 crash threshold (~64 s) 1.5×.
+- Three-phase test: START → device self-disconnect 150 ms → PC waits 20 s → PC reconnects → state="recording" confirmed → STOP → state="idle".
+- Mismatch noted: `info.unsynced` counter still shows 0 while LIST returns 7 unsynced folders. Counter-only cosmetic bug, separate from #36 — track for future cleanup.
+
+Files: `app/src/main.c`, `app/src/ble_sync.c`, `app/src/imu.c`, `CLAUDE.md` (hard rule + Discovered 2026-05-22), `tools/sync.py` (--start-record --hold flag, OP_RESET-via-setup unchanged).
 
 Update cuối 2026-05-14 (scope clarification): mục tiêu "10-min stereo 16k sync < 10-min" là tự đẩy lên, **không phải product requirement thực**. Raw 2-mic audio dùng để **dev noise-cancel algorithm** trên PC; bulk transfer qua **rút SD card**, không qua BLE. BLE sync trong v1.1 phục vụ: control + meta + IMU + audio sample nhỏ để verify recording health. Production v2+ truyền chỉ filtered heart+lung (voice/ambient bị strip on-device cho privacy) → bandwidth tự nhiên thấp, 17 KB/s thừa. **17 KB/s ceiling không block production**. Xem memory `project_sync_scope.md` cho rationale đầy đủ.
 

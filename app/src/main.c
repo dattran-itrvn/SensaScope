@@ -53,10 +53,34 @@ typedef enum {
 
 static app_state_t app_state = APP_STATE_IDLE;
 
-/* v1.1.1: track who started the current recording so we can enforce
- * "start by X → stop by X" symmetry. true = PC tool via BLE OP_START_RECORD;
- * false = local double-tap. Reset to false on session_stop. */
-static bool recording_via_ble = false;
+/* v1.1.2: explicit ownership for the current recording session. Drives the
+ * "start by X → stop by X" symmetry: a tap-started session can only be
+ * stopped by tap; a BLE-started session can only be stopped by BLE STOP
+ * opcode. Replaces the bool `recording_via_ble` (v1.1.1). Reset to NONE
+ * any time the FSM leaves RECORDING. */
+typedef enum {
+	REC_OWNER_NONE,
+	REC_OWNER_TAP,
+	REC_OWNER_BLE,
+} rec_owner_t;
+static rec_owner_t rec_owner = REC_OWNER_NONE;
+
+static const char *rec_owner_name(rec_owner_t o)
+{
+	switch (o) {
+	case REC_OWNER_NONE: return "none";
+	case REC_OWNER_TAP:  return "tap";
+	case REC_OWNER_BLE:  return "ble";
+	}
+	return "?";
+}
+
+/* Exposed to ble_sync.c for opcode dispatch (BUSY-if-recording check). */
+bool app_is_recording(void)
+{
+	return app_state == APP_STATE_RECORDING;
+}
+
 /* #20: state lúc trước khi vào SYNC — restore khi BLE disconnect. Cho phép
  * `ERROR → SYNC → ERROR` (user vớt data từ thẻ SD đầy mà không clear lỗi). */
 static app_state_t pre_sync_state = APP_STATE_IDLE;
@@ -104,21 +128,13 @@ static void transition(app_state_t new_state)
 	if (new_state == app_state) return;
 	LOG_INF("FSM: %s → %s", state_name(app_state), state_name(new_state));
 
-	/* #20: BLE radio control by state.
-	 * - RECORDING tắt advertising (giải phóng radio + tiết kiệm điện).
-	 * - Rời RECORDING → bật lại để PC có thể connect.
-	 * - SYNC giữ nguyên (đang trong connection, no advertising needed).
-	 */
-	if (app_state == APP_STATE_RECORDING && new_state != APP_STATE_RECORDING) {
-		/* v1.1.1: skip adv_start when leaving RECORDING into SYNC — we
-		 * stayed connected during BLE-controlled record, no need (and
-		 * not desirable) to start a second advertiser. */
-		if (new_state != APP_STATE_SYNC) ble_adv_start();
-	}
-	if (new_state == APP_STATE_RECORDING && app_state != APP_STATE_RECORDING) {
-		ble_adv_stop();
-	}
-
+	/* v1.1.2: BLE advertising runs continuously, independent of FSM.
+	 * Started once in start_ble(); restarted in on_disconnected().
+	 * RECORDING no longer tears down the advertiser — PC must be able
+	 * to briefly connect during RECORDING to send OP_STOP_RECORD (owner
+	 * BLE) or get BUSY (owner TAP). Persistent connection during
+	 * RECORDING is still forbidden — enforced via opcode self-disconnect
+	 * in ble_sync.c. */
 	app_state = new_state;
 	led_set_state(state_to_led[new_state]);
 	batt_tick = 0;
@@ -166,17 +182,19 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 	 * connection completes. Reflect that in our local flag. */
 	ble_advertising = false;
 
-	/* #20: gate state-transition by current FSM.
+	/* v1.1.2: gate state-transition by current FSM.
 	 * - IDLE / LOW_BATT_HOLDOFF / ERROR → SYNC (allow draining data).
-	 * - RECORDING → reject (data integrity > convenience). With adv stop
-	 *   when entering RECORDING, this branch should be unreachable except
-	 *   for a race window; defense in depth.
-	 * - SYNC → impossible (no advertising while already in SYNC).
+	 * - RECORDING → accept connection, NO FSM transition. Stay in
+	 *   RECORDING. The opcode handler in ble_sync.c will reply BUSY
+	 *   (owner=TAP) or process OP_STOP_RECORD (owner=BLE) and then
+	 *   queue a self-disconnect to release the link quickly.
+	 * - SYNC → impossible (controller stops adv automatically while
+	 *   already connected; defense in depth).
 	 */
 	switch (app_state) {
 	case APP_STATE_RECORDING:
-		LOG_WRN("BLE: reject connect (RECORDING); disconnecting");
-		bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		LOG_INF("BLE: accept brief connect during RECORDING (owner=%s)",
+			rec_owner_name(rec_owner));
 		return;
 	case APP_STATE_SYNC:
 		LOG_WRN("BLE: unexpected connect while already in SYNC");
@@ -194,28 +212,22 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	ARG_UNUSED(conn);
-	LOG_INF("BLE disconnected (reason 0x%02x, FSM=%s)",
-		reason, state_name(app_state));
+	LOG_INF("BLE disconnected (reason 0x%02x, FSM=%s, owner=%s)",
+		reason, state_name(app_state), rec_owner_name(rec_owner));
 
-	/* #20: rời SYNC → restore state trước SYNC. Trong các state khác
-	 * (e.g., disconnect xảy ra do reject ở on_connected), không transition.
-	 * Restart advertising (trừ khi đang RECORDING — advertising sẽ tự bật
-	 * lại lúc transition rời RECORDING). */
-	/* v1.1.1: if PC disconnected mid-BLE-record, auto-stop the session.
-	 * Symmetric to "start by BLE → stop by BLE"; PC vanishing is the
-	 * implicit stop. Tap-initiated records are unaffected (BLE can't
-	 * be connected during those anyway). */
-	if (app_state == APP_STATE_RECORDING && recording_via_ble) {
-		LOG_WRN("BLE disconnected mid-record — auto-stopping session");
-		session_stop();
-		recording_via_ble = false;
-		transition(APP_STATE_IDLE);
-	} else if (app_state == APP_STATE_SYNC) {
+	/* v1.1.2: disconnect mid-RECORDING is NOT an implicit stop. Session
+	 * keeps running; the only ways to stop are (a) PC reconnect + send
+	 * OP_STOP_RECORD (owner BLE), (b) double-tap (owner TAP), (c) batt
+	 * < BATT_LOW_MV auto-stop in main loop, (d) SW1 power cut. This
+	 * mirrors the "start-by-X = stop-by-X" symmetry and makes
+	 * BLE-driven sessions robust to PC crash / sleep / Wi-Fi drop. */
+	if (app_state == APP_STATE_SYNC) {
 		transition(pre_sync_state);
 	}
-	if (app_state != APP_STATE_RECORDING) {
-		ble_adv_start();
-	}
+	/* Advertising auto-stopped at controller when the connection
+	 * completed. Restart it so the next connection is possible
+	 * regardless of current FSM state (per v1.1.2 always-adv policy). */
+	ble_adv_start();
 }
 
 BT_CONN_CB_DEFINE(conn_cb) = {
@@ -232,16 +244,18 @@ static int start_ble(void)
 	return 0;
 }
 
-/* ---------- Double-tap callback (system work-queue context) ---------- */
-/* v1.1.1: BLE START_RECORD opcode handler. Called from ble_sync via a
- * k_work item (system_work_queue) so FATFS access is safe. Mirrors the
- * IDLE→RECORDING leg of on_double_tap but only valid in SYNC state.
- * Returns 0 on success, -EBUSY for wrong state, -ENOSPC for SD full,
- * -EAGAIN for low battery. */
+/* ---------- BLE START/STOP RECORD opcode handlers ---------- */
+/* v1.1.2: BLE START_RECORD. Valid only when the device was IDLE before
+ * the PC connected (pre_sync_state==IDLE, current==SYNC). On success
+ * sets rec_owner=BLE and transitions SYNC→RECORDING. Ble_sync.c will
+ * issue a self-disconnect right after this returns so the link is not
+ * held during the recording — radio stays in advertising-only mode.
+ * Returns 0 OK, -EBUSY wrong state, -ENOSPC SD full, -EAGAIN low batt. */
 int app_request_start_record_via_ble(void)
 {
-	if (app_state != APP_STATE_SYNC) {
-		LOG_WRN("START_RECORD refused — state=%s", state_name(app_state));
+	if (app_state != APP_STATE_SYNC || pre_sync_state != APP_STATE_IDLE) {
+		LOG_WRN("START_RECORD refused — state=%s pre=%s",
+			state_name(app_state), state_name(pre_sync_state));
 		return -EBUSY;
 	}
 	int batt_mv = battery_read_mv();
@@ -261,49 +275,51 @@ int app_request_start_record_via_ble(void)
 		LOG_ERR("session_start: %d (staying in SYNC)", ret);
 		return ret;
 	}
-	recording_via_ble = true;
+	rec_owner = REC_OWNER_BLE;
 	transition(APP_STATE_RECORDING);
 	return 0;
 }
 
-/* v1.1.1: BLE STOP_RECORD opcode handler. Only stops a session that
- * was BLE-initiated; rejects if the current record is tap-initiated
- * (or no session active). Returns 0 on success, -EBUSY otherwise. */
+/* v1.1.2: BLE STOP_RECORD. Valid only when currently RECORDING with
+ * owner==BLE. On success stops the session, clears owner, transitions
+ * RECORDING→IDLE. Ble_sync.c will self-disconnect after this returns.
+ * Rejects tap-owned sessions (wearer must stop those by double-tap).
+ * Returns 0 OK, -EBUSY otherwise. */
 int app_request_stop_record_via_ble(void)
 {
-	if (app_state != APP_STATE_RECORDING || !recording_via_ble) {
-		LOG_WRN("STOP_RECORD refused — state=%s via_ble=%d",
-			state_name(app_state), recording_via_ble);
+	if (app_state != APP_STATE_RECORDING || rec_owner != REC_OWNER_BLE) {
+		LOG_WRN("STOP_RECORD refused — state=%s owner=%s",
+			state_name(app_state), rec_owner_name(rec_owner));
 		return -EBUSY;
 	}
 	LOG_INF(">>> BLE STOP_RECORD — stopping session");
 	session_stop();
-	recording_via_ble = false;
-	transition(APP_STATE_SYNC);
+	rec_owner = REC_OWNER_NONE;
+	transition(APP_STATE_IDLE);
 	return 0;
 }
 
+/* ---------- Double-tap callback (system work-queue context) ---------- */
 static void on_double_tap(void)
 {
 	switch (app_state) {
 	case APP_STATE_LOW_BATT_HOLDOFF:
 	case APP_STATE_ERROR:
-	case APP_STATE_SYNC:        /* #20: SYNC ↔ RECORDING bị cấm */
+	case APP_STATE_SYNC:        /* SYNC ↔ RECORDING cấm; PC đang dùng link */
 		LOG_INF("tap ignored in %s", state_name(app_state));
 		return;
 
 	case APP_STATE_RECORDING:
-		/* v1.1.1: enforce start-method = stop-method. A BLE-initiated
-		 * record (PC tool) must be stopped via OP_STOP_RECORD, not by
-		 * a stray tap from the wearer. */
-		if (recording_via_ble) {
+		/* v1.1.2: start-method = stop-method. BLE-owned record can
+		 * only be stopped by OP_STOP_RECORD; tap-owned by tap. */
+		if (rec_owner == REC_OWNER_BLE) {
 			LOG_INF("tap ignored — BLE-controlled session, "
 				"use OP_STOP_RECORD");
 			return;
 		}
 		LOG_INF(">>> DOUBLE TAP — stopping session");
 		session_stop();
-		recording_via_ble = false;
+		rec_owner = REC_OWNER_NONE;
 		transition(APP_STATE_IDLE);
 		return;
 
@@ -326,6 +342,7 @@ static void on_double_tap(void)
 			LOG_ERR("session_start: %d (staying in IDLE)", ret);
 			return;
 		}
+		rec_owner = REC_OWNER_TAP;
 		transition(APP_STATE_RECORDING);
 		return;
 	}
@@ -408,11 +425,13 @@ int main(void)
 			if (!session_is_active()) {
 				if (session_was_aborted()) {
 					LOG_ERR("FSM: session aborted by watchdog → ERROR");
+					rec_owner = REC_OWNER_NONE;
 					transition(APP_STATE_ERROR);
 				} else {
 					LOG_INF("Stopped: audio_last=%u B, imu_last=%u samples",
 						sd_writer_audio_bytes_written(),
 						sd_writer_imu_samples_written());
+					rec_owner = REC_OWNER_NONE;
 					transition(APP_STATE_IDLE);
 				}
 				break;
@@ -422,8 +441,11 @@ int main(void)
 				int mv = battery_read_mv();
 				if (mv >= 0 && mv < BATT_LOW_MV) {
 					LOG_WRN("FSM: batt %d mV during RECORDING → "
-						"stop session, LOW_BATT_HOLDOFF", mv);
+						"stop session, LOW_BATT_HOLDOFF "
+						"(was owner=%s)", mv,
+						rec_owner_name(rec_owner));
 					session_stop();
+					rec_owner = REC_OWNER_NONE;
 					transition(APP_STATE_LOW_BATT_HOLDOFF);
 				}
 			}

@@ -6,7 +6,7 @@
 >
 > If §1 is older than 7 days, treat live state as stale — re-derive from `git log --since=7.days` + read recent `TASKS.md` diff + check `docs/PCB_v2_SPEC.md` §13 before acting.
 
-**Last updated:** 2026-05-22 — PROJECT_MAP introduced (ecg_project pattern). Last domain state change: 2026-05-16 PCB v2 SPEC Draft v2.0 published; 2026-05-14 v1.1.1 + v2 algo bench scripts landed.
+**Last updated:** 2026-05-22 evening — v1.1.2 BLE-during-RECORDING redesign + Apple throughput clarification SHIPPED (commits `6fbb6f1` + `47c1a10`). Production firmware locked at `47c1a10`. Phase 2 algorithm bench remains the primary forward work.
 
 ---
 
@@ -14,15 +14,12 @@
 
 ### 1.1 Active goal
 
-Phase 2 enablement: prove on-device noise-cancellation is feasible on v1.0 bench data BEFORE committing PCB v2 to a particular algorithm path. Three parallel tracks:
+Two parallel tracks open after the v1.1.2 BLE redesign closed today's surprise crash issue:
 
-- **Algorithm bench (PC-side)**: NLMS adaptive filter is the leading candidate (cheapest CPU, ports to CMSIS-DSP `arm_lms_norm_f32` on Cortex-M4F). First working pipeline shipped 2026-05-14 (commit `ee75a1b`). Subsequent commits added posture robustness, ambient-mic ablation, doctor-playback export, lung-pipeline preliminary scan. Next step per `playbooks/denoise_test_v1.md`: bench listening test to judge clinical quality. Listening verdict drives whether v2 ships with classical DSP (NLMS) on nRF52840 or escalates to neural denoise / bigger MCU.
+- **Phase 2 algorithm bench (PC-side)** — primary forward work. NLMS adaptive filter is the leading candidate. First working pipeline + posture-robust HR + ambient-mic ablation + doctor-playback export + lung-pipeline preliminary all landed 2026-05-14 (commits `ee75a1b` through `693ef88`). **Next step**: Dat's bench listening test per `playbooks/denoise_test_v1.md` — judges whether NLMS audio is doctor-grade. Verdict drives v2 firmware algorithm choice (classical CMSIS-DSP `arm_lms_norm_f32` vs bigger MCU vs neural denoise).
+- **Hardware path** — `docs/PCB_v2_SPEC.md` Draft v2.0 (2026-05-16) pending Dat's §13 review (6 decisions). Parallel: `docs/PCB_v1_REVIEW_v1.1_PROPOSAL.md` incremental fix path. PCB team meeting pending.
 
-- **PCB v2 spec**: `docs/PCB_v2_SPEC.md` Draft v2.0 (2026-05-16) — pending Dat's review of 6 open decisions in §13 (single vs dual mic, battery 300 vs 500 mAh, substrate hybrid vs full-flex, PPG drop confirmed, adhesive Silbione vs Easyderm, antenna integrated vs u.FL). Em (Cowork) defaulted to dual omni + 300 mAh + hybrid rigid+flex + drop PPG + Silbione + integrated antenna. **No tape-out until §13 confirmed.**
-
-- **PCB v1.1 incremental proposal**: `docs/PCB_v1_REVIEW_v1.1_PROPOSAL.md` (2026-05-16) — separate path for an incremental fix on v1.0 (better body mic + I²C pull-ups + USB-C + brown-out) if v2 full-redesign slips. Review meeting with PCB team pending.
-
-Production v1.1.1 firmware is **locked** for bench data collection while Phase 2 work proceeds.
+Production v1.1.2 firmware is **locked** for bench data collection. The BLE-driven start/stop path (sleep wear use-case) was bench-verified end-to-end this session (100 s sustained, sync → load_session integrity check pass).
 
 ### 1.2 In-flight work items
 
@@ -34,16 +31,23 @@ Production v1.1.1 firmware is **locked** for bench data collection while Phase 2
 | NLMS port to CMSIS-DSP firmware | Claude Code | ⏳ blocked on listening verdict | — |
 | Lung-pipeline iteration (voice rejection) | Cowork + Dat (notebooks) | 🚧 preliminary scan done | `notebooks/v2_lung_pipeline.py`, `v2_lung_phases.py`, `v2_lung_scan.py`, `v2_lung_zoom.py` |
 | Heart S1/S2 fundamental capture | blocked on v2 mic | ⛔ HW-limited | v1.0 body mic MP23DB01HP cuts <130 Hz; IM73D122 (28 Hz) on v2 BOM |
+| Tap threshold 0x10 (~1.0 g) field comfort check | Dat | ⏳ try on next bench wear | `app/src/imu.c:181`. If still misses soft taps, next fallback = relax SHOCK 2→3 in `INT_DUR2`. |
+| SD card cleanup: 6 unsynced sessions (~150 MB) historical | Dat | 🔵 low priority | Rút SD pull nhanh hơn BLE (BLE ~17 KB/s would take ~3 h). Sessions: 2 / 3 / 4 / 5 / 6 / 7. |
+| `info.unsynced` counter mismatch with LIST | Claude Code | 🔵 low priority cosmetic | Counter in Device Info returns 0 while LIST returns 6+. Tracked in TASKS.md #36 close note. Data integrity not affected. |
 
 ### 1.3 Production firmware (locked)
 
-- **Branch**: `main` at commit `693ef88` (v2 algo top of tree, v1.1.1 firmware locked underneath at `e629edf`).
-- **Firmware version exposed via BLE Device Info**: v1.1.1 (build hash from feat branch tip stamped into `meta.json` per session).
-- **Hardware**: PCB v1.0 dated 2026-04-09 (single board produced; bench-only). All known PCB v1.0 quirks worked around in code — see CLAUDE.md.
+- **Branch / commit**: `main` at **`47c1a10`** (v1.1.2 BLE redesign + tap tuning + Apple throughput clarification). Note: top-of-tree includes v2 algorithm notebook commits that don't touch firmware (`693ef88` … `ee75a1b`).
+- **Firmware version**: v1.1.2 (build hash from current commit stamped into `meta.json` per session). The `FW_VERSION` constant still reads `v1.0.0-dev` in code — the version string hasn't been bumped, but commit short SHA in `build_hash` field disambiguates.
+- **Hardware**: PCB v1.0 dated 2026-04-09 (single bench unit). All known PCB v1.0 quirks worked around in code — see CLAUDE.md.
+- **BLE behavior (v1.1.2 hard rule, see CLAUDE.md)**:
+  - BLE advertising runs in ALL FSM states. Persistent connection ONLY valid in SYNC. During RECORDING the device accepts brief opcode-exchange connections (PC connects → sends one opcode → device replies → `schedule_self_disconnect()` fires ~150 ms later).
+  - Recording survives PC disconnect — never auto-stops on link drop. Stop paths: OP_STOP_RECORD (owner BLE), double-tap (owner TAP), batt < BATT_LOW_MV, SD full → ERROR, SW1 power cut.
+  - `enum rec_owner { NONE, TAP, BLE }` enforces start-by-X = stop-by-X.
 - **Operational gotchas to remember**:
   - J-Link debug session with SW1 OFF: chip runs off SWD 3.27 V, but `battery_read_mv()` returns noise → FSM trips to `LOW_BATT_HOLDOFF`. Set `BATT_LOW_MV = 0` in `main.c` for J-Link sessions; revert before commit.
   - Empty session folders (no `.unsynced` marker, or `audio.wav < 44 B`) = crashed before first write → PC sync skips them.
-  - Apple Core Bluetooth refuses DLE upgrade → throughput hard-capped ~17 KB/s. NOT a firmware bug. Live with it; raw bulk audio goes via SD card pull anyway.
+  - **Apple GATT throughput ceiling = 15.5 KB/s sustained** (bench-measured 2026-05-22). Android = 40 KB/s (DLE works). NOT a firmware bug — Apple stack refuses DLE upgrade. See memory `[[project-ble-throughput-host-dependent]]`.
   - 30 GB SanDisk card is EOL (mid-session `-116 ETIME` even post-#32). Bench-trusted card = 122 GB SanDisk. Vet new cards with 5 × 420 s stress before production use.
 
 ### 1.4 Bench data assets
@@ -51,10 +55,10 @@ Production v1.1.1 firmware is **locked** for bench data collection while Phase 2
 | Asset | Path | Notes |
 |---|---|---|
 | Bench session corpus | `/Volumes/SENSAPULSE/SESSION_*` (external SD) | SESSION_00002 (~46.6 s) is the canonical test session — used by every v2 notebook. |
+| Today's v1.1.2 verify sessions | `/tmp/sensapulse_sync_test/chip_361e30a6dd726309/` | SESSION_00008 (1.78 MB, 110 s, BLE-pulled) + SESSION_00009 (6.9 MB, 107.8 s, BLE-pulled). **In /tmp — wiped on reboot**. Move to persistent path if needed for future ref. |
 | Doctor-playback WAVs | `notebooks/doctor_audio/01..05_*_{4,16}kHz.wav` | 5 postures × 2 sample rates × 1 NLMS-cleaned export. Listenable on phone/headphones. |
 | RTT logs from overnight runs | `logs/` (gitignored) | Used by `scripts/parse_rtt.py` to extract metrics. |
-| SD stress run summaries | `logs/sd_stress_*/` | 3 historical stress runs (2026-05-09 phases 1-6). |
-| Overnight run reports | `runs/` (gitignored) | One report per playbook execution. |
+| Throughput probe driver | `/tmp/sync_throughput_probe.py` | Reusable for any sync throughput investigation (Bash sample-every-Ns + subprocess). In /tmp — copy to `scripts/` if reused. |
 
 ### 1.5 Pending decisions (need user input)
 
@@ -62,6 +66,7 @@ Production v1.1.1 firmware is **locked** for bench data collection while Phase 2
 - **Algorithm path lock-in**: after bench listening test, choose `classical NLMS on nRF52840` vs `escalate to bigger MCU` vs `neural denoise on quantized M4F`. Drives v2 firmware roadmap.
 - **PCB v1.1 vs jump straight to v2**: depends on PCB team capacity + lead-time vs schedule. If v1.1 chosen, Phase 2 algo dev gets new bench hardware sooner with corrected body mic.
 - **Production hardening sequencing** (`docs/PRODUCTION_TODO.md`): user has not explicitly directed Claude Code to start any of the post-v1.1 hardening items (pairing/bonding, brown-out detector, MCUboot OTA, etc.). Don't start without explicit direction.
+- **Apple BLE throughput optimization**: **CLOSED 2026-05-22**. User accepts 15.5 KB/s ceiling. Don't invest effort here unless Phase 2 product scope changes to require raw BLE audio over Apple host. Per `[[project-ble-throughput-host-dependent]]`.
 
 ---
 
@@ -241,4 +246,5 @@ One-line summary per milestone. Detailed reports + commits referenced inline.
 - **2026-05-13** — **v1.0 CLOSED**. All `docs/REQUIREMENTS.md` criteria pass. 1-hour production stack verify with #32 fix: 5 rotations clean, ~230 MB audio + ~31000 IMU, 0 drop, 0 FSM ERROR. v1.1 work begins: free-space eviction (#17), session counter validation, PC sync CLI (#21).
 - **2026-05-14** — **v1.1 CLOSED**. BLE bulk notify deadlock root-caused as 2-bug stack: silent-drop past TX pool + system_work_queue ↔ notify callback deadlock (#34 commit `9b5fc1b`). Apple DLE refusal confirmed via HCI DBG — LL=27 hard ceiling ~17 KB/s. Scope clarified: BLE sync = control+meta+IMU+small audio; raw bulk via SD pull. L2CAP CoC code preserved (PSM `0x0080`) for non-Apple host path. Hardening: #31 boot timing + #33 sdlog stuck recovery + #35 firmware silent halt (same root cause as #34). **v1.1.1 BLE-driven record start/stop shipped** (commit `e629edf`). **v2 algorithm bench work begins**: NLMS first working algorithm (`ee75a1b`), posture-robust HR (`956cbae`), doctor-playback + BLE-production exports (`dba7643`), ambient-mic ablation (`406ee90`), lung-sound preliminary scan (`693ef88`).
 - **2026-05-16** — **PCB v2 SPEC Draft v2.0** published (`docs/PCB_v2_SPEC.md`). Scope clarified: Phase 1 is audio source separation (denoise), NOT disease classification → PPG dropped from v2 BOM (saves $13.51 + ~600 µA). 6 open decisions in §13 (single vs dual mic, battery cap, substrate, PPG drop confirmed, adhesive, antenna) pending Dat's review before tape-out. PCB v1.1 incremental proposal also published (`docs/PCB_v1_REVIEW_v1.1_PROPOSAL.md`) as cheaper alternative path. DigiKey BOMs snapshot (PCB_v1_BOM.csv, PCB_v2_BOM.csv).
-- **2026-05-22** — **PROJECT_MAP.md introduced** (this file), pattern from `~/Project/ecg_project/PROJECT_MAP.md`. README refreshed to reflect v1.0 + v1.1 CLOSED + Phase 2 in flight (the previous README still showed v1.0 components as "in progress").
+- **2026-05-22** — **PROJECT_MAP.md introduced** (this file), pattern from `~/Project/ecg_project/PROJECT_MAP.md`. README refreshed to reflect v1.0 + v1.1 CLOSED + Phase 2 in flight (the previous README still showed v1.0 components as "in progress"). Commit `6fbb6f1`.
+- **2026-05-22 (evening)** — **v1.1.2 BLE-during-RECORDING redesign** (#36). Bench surfaced v1.1.1 crash at ~64 s when BLE link held across RECORDING — root cause: BLE controller traffic competing with PDM/SD writer DMA. Redesign per Dat's spec: BLE adv runs in all states, persistent connection only in SYNC, brief opcode-only attach during RECORDING with 150 ms self-disconnect. `enum rec_owner { NONE, TAP, BLE }` enforces start-by-X = stop-by-X. Bench verified: 100 s sustained BLE-driven recording, 0 SOS, 0 watchdog trips. End-to-end sync (BLE start → 100 s record → reconnect+STOP → LIST/READ/ACK → load_session integrity) PASS — SESSION_00009 = 7.1 MB clean. Tap threshold lowered 0x14→0x10 (~1.25 g→~1.0 g) per #22 documented fallback, safe because sleep-wear sessions are BLE-owned. **Apple BLE throughput clarification**: bench-measured 15.5 KB/s sustained on SESSION_00008 via 25-sample sweep. The "14-17 KB/s ceiling" in CLAUDE.md Discovered 2026-05-14 is now marked as **bench-derived math, NOT cited from Apple-published documentation** (the speculation "Apple drops DLE for power/policy reasons" was removed). Dat's dev team's 40 KB/s figure clarified as Android-host (DLE works), not a protocol trick — saved as memory `project_ble_throughput_host_dependent`. Apple optimization formally CLOSED in §1.5 (no further work unless product scope changes). Commit `47c1a10`.

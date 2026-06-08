@@ -41,9 +41,24 @@ static int configure_dmic(void)
 		.channel = {
 			.req_num_streams = 1,
 			.req_num_chan    = AUDIO_PDM_CHANNELS,
+			/* Channel mapping — body MUST land on ch0, ambient on ch1.
+			 *
+			 * The "natural" map below (ch0=LEFT, ch1=RIGHT) is the driver's
+			 * def_map → NRF_PDM_EDGE_LEFTFALLING. Bench tap-test 2026-06-08
+			 * proved that under LEFTFALLING the physical mics come out
+			 * SWAPPED: tapping the body mic clipped ch1, tapping the ambient
+			 * mic clipped ch0. Every v2 notebook assumed ch0=body and was
+			 * therefore analysing the wrong channel.
+			 *
+			 * Fix: use the driver's alt_map (ch0=RIGHT, ch1=LEFT) →
+			 * NRF_PDM_EDGE_LEFTRISING, which the driver documents as the
+			 * L/R-swap. Re-verify with the tap test after any PDM change.
+			 * NOTE: recordings made BEFORE this commit have swapped channels
+			 * (ch0=ambient, ch1=body) — relabel them in analysis.
+			 */
 			.req_chan_map_lo =
-				dmic_build_channel_map(0, 0, PDM_CHAN_LEFT) |
-				dmic_build_channel_map(1, 0, PDM_CHAN_RIGHT),
+				dmic_build_channel_map(0, 0, PDM_CHAN_RIGHT) |
+				dmic_build_channel_map(1, 0, PDM_CHAN_LEFT),
 		},
 	};
 	cfg.streams[0].pcm_rate   = AUDIO_PDM_RATE_HZ;

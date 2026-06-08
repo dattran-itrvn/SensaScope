@@ -6,7 +6,7 @@
 >
 > If §1 is older than 7 days, treat live state as stale — re-derive from `git log --since=7.days` + read recent `TASKS.md` diff + check `docs/PCB_v2_SPEC.md` §13 before acting.
 
-**Last updated:** 2026-05-22 evening — v1.1.2 BLE-during-RECORDING redesign + Apple throughput clarification SHIPPED (commits `6fbb6f1` + `47c1a10`). Production firmware locked at `47c1a10`. Phase 2 algorithm bench remains the primary forward work.
+**Last updated:** 2026-06-08 — **PDM L/R CHANNEL SWAP discovered + fixed.** Bench tap-test proved the body & ambient mics were swapped in the WAV for the project's entire history (file ch0=ambient, ch1=body). Fix on branch `fix/pdm-channel-swap` (FW `823706d` + tools `c1e5471` + docs `3ff7f84`), board reflashed + verified. **This invalidates every prior v2 denoise/ablation conclusion** (they used the ambient mic as "body"). Phase 2 algorithm work is now gated on re-running that analysis with correct channels. Branch NOT yet merged to `main`.
 
 ---
 
@@ -14,26 +14,27 @@
 
 ### 1.1 Active goal
 
-Two parallel tracks open after the v1.1.2 BLE redesign closed today's surprise crash issue:
+The 2026-06-08 session overturned the Phase 2 foundation: a bench tap-test proved the **PDM mics were swapped** (file ch0=ambient, ch1=body — opposite of spec). See CLAUDE.md Discovered 2026-06-08 + memory `[[project-pdm-channel-swap]]` + TASKS.md #37.
 
-- **Phase 2 algorithm bench (PC-side)** — primary forward work. NLMS adaptive filter is the leading candidate. First working pipeline + posture-robust HR + ambient-mic ablation + doctor-playback export + lung-pipeline preliminary all landed 2026-05-14 (commits `ee75a1b` through `693ef88`). **Next step**: Dat's bench listening test per `playbooks/denoise_test_v1.md` — judges whether NLMS audio is doctor-grade. Verdict drives v2 firmware algorithm choice (classical CMSIS-DSP `arm_lms_norm_f32` vs bigger MCU vs neural denoise).
-- **Hardware path** — `docs/PCB_v2_SPEC.md` Draft v2.0 (2026-05-16) pending Dat's §13 review (6 decisions). Parallel: `docs/PCB_v1_REVIEW_v1.1_PROPOSAL.md` incremental fix path. PCB team meeting pending.
+- **Re-run Phase 2 analysis with CORRECT channels** — now the primary forward work, and it BLOCKS the v2 algorithm decision. Every prior result ("NLMS is the leading candidate", the ambient-mic ablation, doctor-playback exports) was computed with the ambient mic mislabelled as body → **invalid, must be redone**. Offline correction is already centralised: `load_session(legacy_channels=True)` (default) un-swaps old recordings; `nlms_denoise --fixed-channels` for new ones. Re-running the notebooks is the next concrete step.
+- **Body-mic capture is also weak** (separate from the swap): bare MEMS on skin → heart inaudible by ear, only a ~72 bpm statistical periodicity; two mics anti-phase coherent (corr ≈ −0.93) from structure-borne coupling on the rigid PCB. Real input for PCB v2 §13 (body mic needs an acoustic coupler; ambient mic needs mechanical isolation) before dual-mic ANC can work at all.
+- **Hardware path** — `docs/PCB_v2_SPEC.md` Draft v2.0 (2026-05-16) pending Dat's §13 review (6 decisions). The swap/coupling findings are fresh input for D1 (single vs dual mic). PCB team meeting deferred by Dat until the source-separation algorithm is proven.
 
-Production v1.1.2 firmware is **locked** for bench data collection. The BLE-driven start/stop path (sleep wear use-case) was bench-verified end-to-end this session (100 s sustained, sync → load_session integrity check pass).
+Production firmware: the board now runs the **channel-swap fix** (branch `fix/pdm-channel-swap`, verified). Build on the board is from the dirty tree (meta stamps `3fb40d2`); a pristine reflash from the branch would stamp `823706d` — cosmetic, behaviour identical. Branch pending Dat's review before merge to `main`.
 
 ### 1.2 In-flight work items
 
 | Item | Owner | Status | Where |
 |---|---|---|---|
-| Bench listening test on NLMS-cleaned audio | Dat (by ear) | ⏳ pending — protocol ready | `playbooks/denoise_test_v1.md` |
-| PCB v2 §13 review (6 decisions) | Dat | ⏳ pending | `docs/PCB_v2_SPEC.md` §13 |
-| PCB v1.1 review meeting with PCB team | Dat + PCB team | ⏳ pending | `docs/PCB_v1_REVIEW_v1.1_PROPOSAL.md` |
-| NLMS port to CMSIS-DSP firmware | Claude Code | ⏳ blocked on listening verdict | — |
-| Lung-pipeline iteration (voice rejection) | Cowork + Dat (notebooks) | 🚧 preliminary scan done | `notebooks/v2_lung_pipeline.py`, `v2_lung_phases.py`, `v2_lung_scan.py`, `v2_lung_zoom.py` |
-| Heart S1/S2 fundamental capture | blocked on v2 mic | ⛔ HW-limited | v1.0 body mic MP23DB01HP cuts <130 Hz; IM73D122 (28 Hz) on v2 BOM |
-| Tap threshold 0x10 (~1.0 g) field comfort check | Dat | ⏳ try on next bench wear | `app/src/imu.c:181`. If still misses soft taps, next fallback = relax SHOCK 2→3 in `INT_DUR2`. |
-| SD card cleanup: 6 unsynced sessions (~150 MB) historical | Dat | 🔵 low priority | Rút SD pull nhanh hơn BLE (BLE ~17 KB/s would take ~3 h). Sessions: 2 / 3 / 4 / 5 / 6 / 7. |
-| `info.unsynced` counter mismatch with LIST | Claude Code | 🔵 low priority cosmetic | Counter in Device Info returns 0 while LIST returns 6+. Tracked in TASKS.md #36 close note. Data integrity not affected. |
+| **Merge `fix/pdm-channel-swap` → `main`** | Dat (review) | ⏳ pending review | 3 commits: `823706d` `c1e5471` `3ff7f84` |
+| **Re-run ALL v2 notebooks with correct channels** | Claude Code | ⏳ NEXT — gates v2 algo decision | TASKS.md #37. `load_session` already un-swaps; just rerun + re-judge |
+| NLMS / ambient-ANC viability re-evaluation | Claude Code + Dat | ⏳ unblocked once notebooks rerun | Prior "leading candidate" verdict void. Body-mic coupling caveat applies |
+| (optional) Pristine reflash from branch for traceable hash | Claude Code | 🔵 cosmetic | Board behaviour already correct; only meta `build_hash` differs |
+| SD io_err: remount-on-CARD_DETECT + read-under-BLE robustness | Claude Code | ⏳ low pri (field/prod) | TASKS.md #38 |
+| PCB v2 §13 review (6 decisions) — swap/coupling = fresh D1 input | Dat | ⏳ pending | `docs/PCB_v2_SPEC.md` §13 |
+| PCB team meeting | Dat + PCB team | ⏳ deferred by Dat | until source-separation algo proven |
+| Tap threshold 0x10 (~1.0 g) field comfort check | Dat | ⏳ try on next bench wear | `app/src/imu.c:181`; fallback = relax SHOCK 2→3 in `INT_DUR2` |
+| `info.unsynced` counter mismatch with LIST | Claude Code | 🔵 low priority cosmetic | Device Info returns 0 while LIST returns 6+. Data integrity unaffected |
 
 ### 1.3 Production firmware (locked)
 
@@ -248,3 +249,4 @@ One-line summary per milestone. Detailed reports + commits referenced inline.
 - **2026-05-16** — **PCB v2 SPEC Draft v2.0** published (`docs/PCB_v2_SPEC.md`). Scope clarified: Phase 1 is audio source separation (denoise), NOT disease classification → PPG dropped from v2 BOM (saves $13.51 + ~600 µA). 6 open decisions in §13 (single vs dual mic, battery cap, substrate, PPG drop confirmed, adhesive, antenna) pending Dat's review before tape-out. PCB v1.1 incremental proposal also published (`docs/PCB_v1_REVIEW_v1.1_PROPOSAL.md`) as cheaper alternative path. DigiKey BOMs snapshot (PCB_v1_BOM.csv, PCB_v2_BOM.csv).
 - **2026-05-22** — **PROJECT_MAP.md introduced** (this file), pattern from `~/Project/ecg_project/PROJECT_MAP.md`. README refreshed to reflect v1.0 + v1.1 CLOSED + Phase 2 in flight (the previous README still showed v1.0 components as "in progress"). Commit `6fbb6f1`.
 - **2026-05-22 (evening)** — **v1.1.2 BLE-during-RECORDING redesign** (#36). Bench surfaced v1.1.1 crash at ~64 s when BLE link held across RECORDING — root cause: BLE controller traffic competing with PDM/SD writer DMA. Redesign per Dat's spec: BLE adv runs in all states, persistent connection only in SYNC, brief opcode-only attach during RECORDING with 150 ms self-disconnect. `enum rec_owner { NONE, TAP, BLE }` enforces start-by-X = stop-by-X. Bench verified: 100 s sustained BLE-driven recording, 0 SOS, 0 watchdog trips. End-to-end sync (BLE start → 100 s record → reconnect+STOP → LIST/READ/ACK → load_session integrity) PASS — SESSION_00009 = 7.1 MB clean. Tap threshold lowered 0x14→0x10 (~1.25 g→~1.0 g) per #22 documented fallback, safe because sleep-wear sessions are BLE-owned. **Apple BLE throughput clarification**: bench-measured 15.5 KB/s sustained on SESSION_00008 via 25-sample sweep. The "14-17 KB/s ceiling" in CLAUDE.md Discovered 2026-05-14 is now marked as **bench-derived math, NOT cited from Apple-published documentation** (the speculation "Apple drops DLE for power/policy reasons" was removed). Dat's dev team's 40 KB/s figure clarified as Android-host (DLE works), not a protocol trick — saved as memory `project_ble_throughput_host_dependent`. Apple optimization formally CLOSED in §1.5 (no further work unless product scope changes). Commit `47c1a10`.
+- **2026-06-08** — **PDM L/R channel swap discovered + fixed; Phase 2 foundation invalidated.** A bench session (start with BLE-driven record, then a deliberate physical diagnosis) uncovered that the body & ambient PDM mics were swapped in the WAV for the project's entire history: file ch0=ambient, ch1=body (opposite of spec). Found via tap-test (tap body mic → ch1 clips; tap ambient → ch0 clips, SESSION_00002). Root cause: `audio.c` used driver `def_map` → `NRF_PDM_EDGE_LEFTFALLING`, inverting the ST mics' L/R-via-clock-edge convention. Fixed with `alt_map` → LEFTRISING; verified SESSION_00003 (body taps now clip ch0). **Consequence: every prior v2 denoise/ablation result is invalid** (analysed the ambient mic as "body", used the body mic as the noise reference — explains all the ambiguous results). Offline fix centralised in `load_session(legacy_channels=True)` + `nlms_denoise --fixed-channels` (zero notebook edits). Also found this session: the bare-MEMS body mic couples heart/lung poorly (inaudible by ear, ~72 bpm only statistical) and the two mics are anti-phase coherent (corr ≈ −0.93, structure-borne on rigid PCB) — input for PCB v2 §13. Plus: board was found running v1.1.1 despite docs claiming v1.1.2 (reflashed); SD io_err on card hot-swap (no remount-on-CARD_DETECT) + on BLE-READ at 5.4 MB; Apple throughput measured ~8.7 KB/s (half of 15.5, host-negotiated interval). Branch `fix/pdm-channel-swap` (`823706d` + `c1e5471` + `3ff7f84`) NOT yet merged. CLAUDE.md Discovered + memories `[[project-pdm-channel-swap]]`, `[[feedback-check-build-hash-before-recording]]` + TASKS.md #37/#38.

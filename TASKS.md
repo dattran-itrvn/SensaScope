@@ -188,6 +188,21 @@ Update 2026-05-14: **#34 + #35 đã được fix** (commit `9b5fc1b`). Bulk READ
 
 Update tiếp 2026-05-14 (Apple DLE deep-dive): tăng N_NOTIFY_SLOTS=16 + interval 15 ms request + L2CAP CoC (PSM `0x0080`) đẩy throughput lên 14-17 KB/s. HCI DBG log xác nhận **Apple Core Bluetooth từ chối DLE upgrade** (LL_LENGTH_RSP 27/27 cả macOS và iOS) — quan sát over-air, **không trích từ Apple-published doc**. Hard cap LL=27 byte không thể vượt qua từ firmware side. Throughput ceiling ~17 KB/s ↔ Apple host = **derived math từ measurement**, không phải Apple-stated number. 2026-05-22 bench đo 25-sample được **15.5 KB/s sustained** trên SESSION_00008 — confirm ceiling math. Apple's public "Bluetooth Accessory Design Guidelines for Apple Products" không document DLE behaviour hay throughput cap. Xem CLAUDE.md Discovered notes 2026-05-14 + 2026-05-22 cho HCI detail + measurement.
 
+**#38 ⏳ SD io_err on card hot-swap + BLE-READ — needs remount + read robustness** (2026-06-08)
+
+Two SD `io_err`s observed 2026-06-08: (a) START_RECORD returns `io_err` after a card erase/reinsert because firmware does NOT remount on CARD_DETECT (P0.26) — only a reboot (SW1 OFF/ON or reflash) re-runs `sdlog_init`/`disk_access_init`; (b) BLE READ failed `io_err` mid-sync at ~5.4 MB of 15.3 MB, yet the file was fully intact + readable on the Mac → FATFS-read-under-BLE-load fragility, not a dead card. Open: (1) remount-on-CARD_DETECT so hot-swap works without reboot; (2) harden SD read path under concurrent BLE notify load. Detail in CLAUDE.md Discovered 2026-06-08. Low priority for bench (SD-pull workflow unaffected), matters for field/production.
+
+**#37 🚧 PDM L/R channels swapped — body was on ch1, ambient on ch0** (2026-06-08)
+
+Found by bench tap-test: tapping the body mic clipped WAV ch1, tapping ambient clipped ch0 (SESSION_00002) — physical mics swapped vs spec. Root cause: `audio.c` used driver `def_map` (ch0=LEFT,ch1=RIGHT) → `NRF_PDM_EDGE_LEFTFALLING`, which inverts the ST mics' L/R-via-clock-edge convention. Fix: `alt_map` (ch0=RIGHT,ch1=LEFT) → LEFTRISING. **Verified** SESSION_00003: body taps now clip ch0.
+
+✅ done: FW fix (`823706d`) + offline un-swap centralised in `load_session(legacy_channels=True)` + `nlms_denoise --fixed-channels` (`c1e5471`), branch `fix/pdm-channel-swap`. CLAUDE.md Discovered + memory updated.
+
+⏳ open follow-ups:
+- **Re-run ALL v2 denoise/ablation notebooks with correct channels** — every pre-fix conclusion (incl. "NLMS is the leading candidate" in PROJECT_MAP) used the AMBIENT mic as "body" and is INVALID. This gates the v2 algorithm decision.
+- Merge `fix/pdm-channel-swap` → `main` (pending user review).
+- Investigate body-mic acoustic coupling (inaudible heart by ear; ~72 bpm only statistical) + anti-phase 2-mic coupling (corr ≈ −0.93) — input for PCB v2 §13 mechanical design.
+
 **#36 ✅ BLE-during-RECORDING crash — v1.1.2 redesign** (2026-05-22)
 
 Symptom (v1.1.1): BLE-driven recording crashed FSM to ERROR (SOS LED) ~64 s in. Bench repro: `tools/sync.py --start-record --hold` (link held), audio.wav truncated at ~3.98 MB on SESSION_00002, watchdog tripped.

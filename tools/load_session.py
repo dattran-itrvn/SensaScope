@@ -5,12 +5,21 @@ Loads a session folder produced by SensaPulse v1.0 firmware
 notebooks and the offline ML pipeline:
 
     load_session(path) → {
-        "audio":    np.ndarray (N, 2) int16   — ch0=body, ch1=ambient
+        "audio":    np.ndarray (N, 2) int16   — col0=body, col1=ambient
         "fs_audio": int (16000)
         "imu":      pd.DataFrame[t_us,ax,ay,az,gx,gy,gz]
         "fs_imu":   int (52)
         "meta":     dict (parsed meta.json)
     }
+
+    CHANNEL ORDER — read this. Firmware BEFORE the 2026-06-08 PDM L/R fix
+    (app/src/audio.c) wrote the two mics SWAPPED: file col0 = ambient,
+    col1 = body (proven by bench tap-test, SESSION_00002 vs 00003). Every
+    notebook + this loader assume col0=body, so load_session un-swaps
+    legacy recordings by default (legacy_channels=True). Recordings from
+    fixed firmware are already body-first → pass legacy_channels=False.
+    The meta.json hash can NOT distinguish the two (the fix shipped
+    uncommitted, same hash), so this is an explicit caller choice.
 
 Why stdlib `wave` instead of `scipy.io.wavfile`? scipy is an ~80 MB
 dependency for one read. The stdlib module + numpy.frombuffer
@@ -59,11 +68,18 @@ def _read_wav(path: Path) -> Tuple[int, np.ndarray]:
     return sr, arr
 
 
-def load_session(path: Union[Path, str]) -> dict:
+def load_session(path: Union[Path, str], legacy_channels: bool = True) -> dict:
     """Load a SensaPulse session folder.
 
     `path` should be the directory holding audio.wav + imu.csv + meta.json.
     Raises FileNotFoundError if any of the three is missing.
+
+    legacy_channels: pre-2026-06-08 firmware wrote the PDM mics swapped
+    (file col0=ambient, col1=body). When True (default), the audio columns
+    are reversed so the returned array is body-first (col0=body, col1=ambient)
+    — what every caller assumes. Set False for recordings made by fixed
+    firmware (app/src/audio.c alt_map / NRF_PDM_EDGE_LEFTRISING). See the
+    module docstring + the bench tap-test note.
     """
     path = Path(path)
     audio_path = path / _AUDIO_NAME
@@ -75,6 +91,9 @@ def load_session(path: Union[Path, str]) -> dict:
             raise FileNotFoundError(f"{p.name} not found in {path}")
 
     sr, audio = _read_wav(audio_path)
+    if legacy_channels and audio.ndim == 2 and audio.shape[1] == 2:
+        # Un-swap the legacy PDM channel order → col0=body, col1=ambient.
+        audio = audio[:, ::-1].copy()
     imu  = pd.read_csv(imu_path)
     meta = json.loads(meta_path.read_text())
 

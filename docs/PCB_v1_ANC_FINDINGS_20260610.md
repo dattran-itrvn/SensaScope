@@ -104,3 +104,52 @@ Reading:
 - Recordings (local only, `*.wav` git-ignored): `recordings/20260609_anc_protocol`,
   `…_newtape`, `…_board_off_skin`, `recordings/20260610_acoustic_chamber`, `…_upper_chest`,
   `…_offbody_ambient`. All firmware `c3d02c3` (fixed-era).
+
+---
+
+## Addendum — session 2 (2026-06-10): decisive mechanism + a capture bug
+
+### DECISIVE: the body channel is a CONTACT/vibration pickup, not air-acoustic
+A chamber whose skin-side acoustic port was accidentally **sealed** by the double-sided
+tape (no open air path to the MEMS) **still captured the heart signal** (20–60 Hz core +
+cardiac periodicity, 60–150 Hz ~7%). Signal surviving a sealed port ⇒ it reaches the mic by
+**mechanical contact/vibration through the tape + structure**, NOT an open-air acoustic path.
+This resolves the earlier open question: the device works as a **seismocardiography-style
+contact sensor**. To get crisp air-acoustic S1/S2 (60–150 Hz, stethoscope-like) v2 needs a
+genuine acoustic path — open air cavity + diaphragm (bell), or a gel acoustic coupler with the
+port OPEN — not a bare MEMS sealed to skin.
+
+### Real-PCG comparison stands (PhysioNet a0001/a0028/a0069)
+Heart sound is intrinsically low-frequency: real PCGs ~14% (<20 Hz) + ~68% (20–60 Hz) +
+~15% (60–150 Hz). The device captures the 20–60 Hz core but has **~3× excess <20 Hz motion**
+and a **~10× deficit at 60–150 Hz**. What was "heard as heart sound" before = this low band
+amplified ~100–500×. Confirmed by ear: the device's 20–200 Hz clip ≈ a real PCG band-limited
+to its low part.
+
+### Mounting micro-variations are within noise / confounded
+Across the chamber trials (hole 3 mm vs 2 mm, white-thick vs 2 mm-black board foam, position),
+the <20 Hz and 60–150 Hz differences (a few %) are small, and **multiple variables changed per
+recording** — no single-variable cause is attributable. Rule for future: change ONE variable
+per recording. The one robust trend remains: rigid 3M skin-bond is worst for 60–150 Hz (1.6%),
+softer/isolated mounts somewhat better (~7–8%), but none reach the ~15% real-PCG level.
+
+### CAPTURE BUG (firmware robustness, for backlog): PDM stereo → mono-duplicated at startup
+Intermittently, both WAV channels come out **bit-identical** (ch0==ch1), i.e. the PDM stereo
+capture collapses to one stream duplicated into both slots. Observed 0.1% → 100% identical
+across recordings, **independent of battery** (100% corrupt even at full 4352 mV) — so NOT a
+brown-out, NOT the SD card (whole-file duplication is a capture-path signature). It **clears
+after several re-inits** (one boot run went 100% → 0.2% over successive short sessions). A
+clean tap-test once recovered confirms **both mics are healthy and mapping is intact**
+(body→ch0, ambient→ch1). Likely an init/timing glitch in the PDM L/R edge capture, aggravated
+by the day's heavy SD hot-swapping + start/stop cycling without clean reboots.
+
+**Mandatory hygiene from now on:** validate `ch0==ch1 %` on every recording and DISCARD any
+with >~2% identical samples before analysis. Proposed: (a) firmware guard at PDM init that
+checks the two channels aren't identical and retries; (b) offline guard in `tools/load_session.py`
+that warns/raises on near-duplicate channels.
+
+### Hardware/firmware status at session end
+Device firmware `c3d02c3` on battery. After ~10 short glitchy sessions the capture recovered
+to clean stereo. Recommended before next measurement: **reflash** (`scripts/build_flash.sh`)
+to reset PDM/SD/DMA state, then record ~20 s and confirm `ch0==ch1 < 2%` before trusting data.
+The 30 GB SanDisk is end-of-life (CLAUDE.md); prefer the 122 GB vetted card.
